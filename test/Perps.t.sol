@@ -42,12 +42,12 @@ contract PerpsTest is Test {
     PoolKey k;
 
     function setUp() public {
-        PM = IPoolManager(address(new PoolManager(address(this))));
+        PM = IPoolManager(vm.deployCode("PoolManager.sol:PoolManager", abi.encode(address(this))));
         (L, hook, pool) = _deploy();
         t = _launch(L);
         vm.deal(address(this), 1 ether);
         (address e, address v) =
-            pool.createPerps{value: 0.05 ether}(type(PerpEngine).creationCode, type(PerpVault).creationCode);
+            pool.createPerps{value: 0.05 ether}(_engineCode(), _vaultCode());
         (engine, vault) = (PerpEngine(payable(e)), PerpVault(payable(v)));
         k = pool.poolKey();
         vm.deal(STAKER, 20 ether);
@@ -74,25 +74,25 @@ contract PerpsTest is Test {
     }
 
     function test_ThePerpsCodeIsTheAuditedCode() public {
-        assertEq(keccak256(type(PerpEngine).creationCode), pool.ENGINE_CODE_HASH(), "the engine this commit builds");
-        assertEq(keccak256(type(PerpVault).creationCode), pool.VAULT_CODE_HASH(), "the vault this commit builds");
+        assertEq(keccak256(_engineCode()), pool.ENGINE_CODE_HASH(), "the engine this commit builds");
+        assertEq(keccak256(_vaultCode()), pool.VAULT_CODE_HASH(), "the vault this commit builds");
         vm.expectRevert(IMD6900LockedPool.PerpsExist.selector);
-        pool.createPerps(type(PerpEngine).creationCode, type(PerpVault).creationCode);
+        pool.createPerps(_engineCode(), _vaultCode());
         // a fresh launch: not before the pool opens, and not any other code
         (IMD6900RobinhoodLaunch l2,, IMD6900LockedPool p2) = _deploy();
         vm.expectRevert(IMD6900LockedPool.NotOpen.selector);
-        p2.createPerps(type(PerpEngine).creationCode, type(PerpVault).creationCode);
+        p2.createPerps(_engineCode(), _vaultCode());
         _launch(l2);
-        bytes memory other = abi.encodePacked(type(PerpEngine).creationCode, hex"00");
+        bytes memory other = abi.encodePacked(_engineCode(), hex"00");
         vm.expectRevert(IMD6900LockedPool.NotThePerpsCode.selector);
-        p2.createPerps(other, type(PerpVault).creationCode);
+        p2.createPerps(other, _vaultCode());
         vm.expectRevert(IMD6900Hook.OnlyPool.selector);
         hook.initPerpEngine(address(1));
     }
 
     function test_ThePerpsPassTheAdmissionScan() public view {
-        _scan(type(PerpEngine).creationCode, "engine creation code");
-        _scan(type(PerpVault).creationCode, "vault creation code");
+        _scan(_engineCode(), "engine creation code");
+        _scan(_vaultCode(), "vault creation code");
         _scan(address(engine).code, "engine");
         _scan(address(vault).code, "vault");
         assertLe(address(engine).code.length, 24_576, "under the code size limit");
@@ -184,7 +184,7 @@ contract PerpsTest is Test {
     /*                               HELPERS                                */
 
     function _deploy() internal returns (IMD6900RobinhoodLaunch l, IMD6900Hook h, IMD6900LockedPool p) {
-        l = new IMD6900RobinhoodLaunch(OWNER, PM, address(new MockImdstr()), TL);
+        l = _newLaunch(OWNER, PM, address(new MockImdstr()), TL);
         h = l.createHook(HookSalt.mine(l));
         p = l.pool();
     }
@@ -212,5 +212,19 @@ contract PerpsTest is Test {
         y = x;
         uint256 z = (x + 1) / 2;
         while (z < y) (y, z) = (z, (x / z + z) / 2);
+    }
+
+    /// @dev The launch from its build artifact (as deployed), rather than `new`: a test contract that embeds the
+    ///      launch's creation code (and the PoolManager's, and the perps') costs the swarm's build machine too much
+    function _newLaunch(address owner_, IPoolManager pm, address imdstr_, address tl) internal returns (IMD6900RobinhoodLaunch) {
+        return IMD6900RobinhoodLaunch(payable(vm.deployCode("IMD6900RobinhoodLaunch.sol:IMD6900RobinhoodLaunch", abi.encode(owner_, pm, imdstr_, tl))));
+    }
+
+    function _engineCode() internal view returns (bytes memory) {
+        return vm.getCode("PerpEngine.sol:PerpEngine");
+    }
+
+    function _vaultCode() internal view returns (bytes memory) {
+        return vm.getCode("PerpVault.sol:PerpVault");
     }
 }

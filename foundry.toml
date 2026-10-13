@@ -25,3 +25,6 @@ remappings = [
 
 [rpc_endpoints]
 robinhood = "${ROBINHOOD_RPC_URL}"
+
+[lint]
+lint_on_build = false

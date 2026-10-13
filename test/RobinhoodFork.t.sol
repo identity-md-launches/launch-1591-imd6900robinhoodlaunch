@@ -91,7 +91,7 @@ contract RobinhoodForkTest is Test {
         if (bytes(rpc).length == 0) return;
         vm.createSelectFork(rpc);
         live = true;
-        L = new IMD6900RobinhoodLaunch(TEAM, PM, address(IMDSTR), TL);
+        L = _newLaunch(TEAM, PM, address(IMDSTR), TL);
         L.createHook(HookSalt.mine(L));
     }
 
@@ -167,7 +167,7 @@ contract RobinhoodForkTest is Test {
 
         // the perps, created right after the launch from the audited code (by hash), live at once, fee-free by refund
         vm.deal(address(this), 1 ether);
-        (address e, address v) = pool.createPerps{value: 0.05 ether}(type(PerpEngine).creationCode, type(PerpVault).creationCode);
+        (address e, address v) = pool.createPerps{value: 0.05 ether}(_engineCode(), _vaultCode());
         PerpEngine engine = PerpEngine(payable(e));
         assertEq(engine.owner(), TL);
         vm.deal(address(0x57A4E), 5 ether);
@@ -237,5 +237,19 @@ contract RobinhoodForkTest is Test {
         y = x;
         uint256 z = (x + 1) / 2;
         while (z < y) (y, z) = (z, (x / z + z) / 2);
+    }
+
+    /// @dev The launch from its build artifact (as deployed), rather than `new`: a test contract that embeds the
+    ///      launch's creation code (and the PoolManager's, and the perps') costs the swarm's build machine too much
+    function _newLaunch(address owner_, IPoolManager pm, address imdstr_, address tl) internal returns (IMD6900RobinhoodLaunch) {
+        return IMD6900RobinhoodLaunch(payable(vm.deployCode("IMD6900RobinhoodLaunch.sol:IMD6900RobinhoodLaunch", abi.encode(owner_, pm, imdstr_, tl))));
+    }
+
+    function _engineCode() internal view returns (bytes memory) {
+        return vm.getCode("PerpEngine.sol:PerpEngine");
+    }
+
+    function _vaultCode() internal view returns (bytes memory) {
+        return vm.getCode("PerpVault.sol:PerpVault");
     }
 }

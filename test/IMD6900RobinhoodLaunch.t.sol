@@ -172,9 +172,9 @@ contract IMD6900RobinhoodLaunchTest is Test {
     bytes32 SALT;
 
     function setUp() public {
-        PM = IPoolManager(address(new PoolManager(address(this))));
+        PM = IPoolManager(vm.deployCode("PoolManager.sol:PoolManager", abi.encode(address(this))));
         imdstr = new MockImdstr();
-        L = new IMD6900RobinhoodLaunch(OWNER, PM, address(imdstr), TL);
+        L = _newLaunch(OWNER, PM, address(imdstr), TL);
         hook = L.createHook(HookSalt.mine(L));
         pool = L.pool();
         SALT = CoinSalt.mine(L); // the coin's 0x6900 salt, as script/mine.sh finds it
@@ -187,7 +187,7 @@ contract IMD6900RobinhoodLaunchTest is Test {
     /*                                ADMISSION                              */
 
     function test_DeploysOnAFreshChain() public {
-        IMD6900RobinhoodLaunch l = new IMD6900RobinhoodLaunch(OWNER, NO_CODE, address(imdstr), TL);
+        IMD6900RobinhoodLaunch l = _newLaunch(OWNER, NO_CODE, address(imdstr), TL);
         l.createHook(HookSalt.mine(l));
         assertEq(l.owner(), OWNER);
         assertEq(l.pool().hook(), address(l.hook()));
@@ -199,7 +199,7 @@ contract IMD6900RobinhoodLaunchTest is Test {
 
     function test_FitsOneTransaction() public {
         uint256 g = gasleft();
-        IMD6900RobinhoodLaunch l = new IMD6900RobinhoodLaunch(OWNER, PM, address(imdstr), TL);
+        IMD6900RobinhoodLaunch l = _newLaunch(OWNER, PM, address(imdstr), TL);
         uint256 used = g - gasleft();
         emit log_named_uint("launch deploy gas (the same for every deployer: no mining)", used);
         assertLt(used, 1 << 23, "half EIP-7825's per-transaction cap");
@@ -212,7 +212,7 @@ contract IMD6900RobinhoodLaunchTest is Test {
     }
 
     function test_PassesTheAdmissionScan() public view {
-        _scan(type(IMD6900RobinhoodLaunch).creationCode, "launch creation code");
+        _scan(vm.getCode("IMD6900RobinhoodLaunch.sol:IMD6900RobinhoodLaunch"), "launch creation code");
         _scan(address(L).code, "launch");
         _scan(address(hook).code, "hook");
         _scan(address(pool).code, "pool");
@@ -227,7 +227,7 @@ contract IMD6900RobinhoodLaunchTest is Test {
     }
 
     function test_EachDeployerMinesItsOwnHook() public {
-        IMD6900RobinhoodLaunch b = new IMD6900RobinhoodLaunch(OWNER, PM, address(imdstr), TL);
+        IMD6900RobinhoodLaunch b = _newLaunch(OWNER, PM, address(imdstr), TL);
         bytes32 s = HookSalt.mine(b);
         b.createHook(s);
         assertTrue(address(b.hook()) != address(hook));
@@ -236,7 +236,7 @@ contract IMD6900RobinhoodLaunchTest is Test {
     }
 
     function test_TheHookIsCreatedOnceAtAFittingSalt() public {
-        IMD6900RobinhoodLaunch b = new IMD6900RobinhoodLaunch(OWNER, PM, address(imdstr), TL);
+        IMD6900RobinhoodLaunch b = _newLaunch(OWNER, PM, address(imdstr), TL);
         assertEq(address(b.hook()), address(0));
         assertEq(b.pool().hook(), address(0), "the pool can't open before");
         bytes32 s = HookSalt.mine(b);
@@ -924,5 +924,11 @@ contract IMD6900RobinhoodLaunchTest is Test {
             p[0] = leaves[i == 0 ? 1 : 0];
             p[1] = leaves[2];
         }
+    }
+
+    /// @dev The launch from its build artifact (as deployed), rather than `new`: a test contract that embeds the
+    ///      launch's creation code (and the PoolManager's, and the perps') costs the swarm's build machine too much
+    function _newLaunch(address owner_, IPoolManager pm, address imdstr_, address tl) internal returns (IMD6900RobinhoodLaunch) {
+        return IMD6900RobinhoodLaunch(payable(vm.deployCode("IMD6900RobinhoodLaunch.sol:IMD6900RobinhoodLaunch", abi.encode(owner_, pm, imdstr_, tl))));
     }
 }
