@@ -73,6 +73,7 @@ contract IMD6900Hook is BaseHook, Ownable {
     /// @notice The perps engine could not run its sweep at all
     error SweepUnavailable();
     error NoRenounce();
+    error EngineSet();
 
     /// @param owner_ the Robinhood timelock: the engine and the escape hatch wait out its delay
     constructor(IPoolManager poolManager_, address pool_, address owner_) BaseHook(poolManager_) {
@@ -123,6 +124,18 @@ contract IMD6900Hook is BaseHook, Ownable {
     function setPerpEngine(address engine) external onlyOwner {
         perpEngine = engine;
         emit PerpEngineSet(engine);
+    }
+
+    /// @notice The perps engine the locked pool creates right after the launch (IMD6900LockedPool.createPerps), wired
+    ///         at once and fee-free by refund. Only the locked pool, only while no engine is set: every later change
+    ///         is the timelock's ({setPerpEngine}, {setPerpRefunded}).
+    function initPerpEngine(address engine) external {
+        if (msg.sender != pool) revert OnlyPool();
+        if (perpEngine != address(0)) revert EngineSet();
+        perpEngine = engine;
+        perpRefunded = true;
+        emit PerpEngineSet(engine);
+        emit PerpRefundedSet(true);
     }
 
     /// @notice Set with the engine it describes: only an engine that calls the refund pair may be reported fee-free

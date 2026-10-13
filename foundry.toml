@@ -19,6 +19,8 @@ remappings = [
     "@uniswap/v4-periphery/=lib/v4-periphery/",
     "forge-std/=lib/forge-std/src/",
     "solmate/=lib/solmate/",
+    "v4-core/=lib/v4-core/",
+    "@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/",
 ]
 
 [rpc_endpoints]

@@ -22,7 +22,7 @@ and the old IMDSTR claims the new coin 1:1, up to each holder's snapshot balance
    with 0x6900: `script/mine.sh` mines the salt for the deployed launch);
 2. opens the pool at `sqrtPriceX96` with all 1B as IMD6900-only liquidity from that price down: no ETH needed, locked;
 3. buys first with every wei the launch holds (nobody can trade before: the coin didn't exist a moment earlier);
-4. keeps the claims' reserve, and keeps the rest of what it bought in the launch: only the timelock moves it (`sellHeld`, `releaseExcess`, 12h public delay), so no wallet ever holds it.
+4. keeps the claims' reserve, and keeps the rest of what it bought in the launch: only the timelock moves it (`sellHeld`, `releaseExcess`, the timelock's public delay (24h)), so no wallet ever holds it.
 
 The opening price and the buy come from `script/params.py`, so that after the buy the coin trades at exactly IMD6900's
 Ethereum price: the pool opens on a tick (0.6% apart), so it rounds the opening onto one and sizes the buy to land on
@@ -43,7 +43,7 @@ The road to the pot, end to end (each step anyone's to call; `script/launch.sh p
 `burnImd(min)` for the $IMD share, the pot bridge's `bridge()` (Robinhood → Across → Ethereum, from 0.05 ETH), then on
 Ethereum the pot hook's `depositBridgedFees()` (`0xA160…6444`), which adds it to the NFT pot: the strategy buys
 identity.md NFTs at the floor with it, and what it resells them for buys IMD6900 on Ethereum. Rehearsed on forks of
-both chains: 0.1 ETH bridged over Across, then 0.0995 into the pot. The split is the Robinhood timelock's to change (`setPayees`, 12h public delay).
+both chains: 0.1 ETH bridged over Across, then 0.0995 into the pot. The split is the Robinhood timelock's to change (`setPayees`, the timelock's public delay (24h)).
 
 ## The fee, and routing
 
@@ -56,7 +56,7 @@ with a refund-aware engine (PerpSwapLib.swapLeg), then only Uniswap's protocol f
 
 4.44%, a plain static fee: Uniswap's router quotes the pool on its own (no dynamic fee, no return deltas, not a 0x91
 hook; Programmable's plan opts in to the hook list and Uniswap's API too). A v4 pool's fee can't change, so lowering it
-means a new pool: `lowerFee(newFee)` (the timelock, behind its 12h delay; only ever lower, 0 allowed) initializes the
+means a new pool: `lowerFee(newFee)` (the timelock, behind its 24h delay; only ever lower, 0 allowed) initializes the
 ETH / IMD6900 pool at `newFee` at the current price, and moves the whole position there in one unlock. Nothing leaves
 but the old pool's earned fees (to the split, like any `collect`); the old pool is left empty and its swaps revert; the
 new one is routable the same way (the fork test buys through the Universal Router before and after a move to 3.33%).
@@ -64,24 +64,36 @@ new one is routable the same way (the fork test buys through the Universal Route
 ## The opening buy's ETH, back if wanted
 
 Before the launch the ETH never leaves the team wallet (`withdrawEth` returns anything sent early). After it, the ETH
-sits in the pool against the coins the buy landed, and the launch holds those coins. The timelock (12h public delay)
+sits in the pool against the coins the buy landed, and the launch holds those coins. The timelock (the timelock's public delay (24h))
 can sell them back into the pool, ETH to any address (`sellHeld(amount, minEth, to)`), and can end the claims early
-(`endClaims()`: the unclaimed reserve joins what it can sell; holders see it 12h ahead and can claim first; what they
+(`endClaims()`: the unclaimed reserve joins what it can sell; holders see it 24h ahead and can claim first; what they
 claimed is theirs). The sale is fee-free (the refund above, three rounds in one transaction), so selling everything
 right after the launch returns what the buy put into the curve; the buy's own 4.44% went to the split (all of it back
 too if the timelock points the split at the team for that harvest). In tests: 2.8098 of 2.81 ETH with nobody's claim
 kept; on a Robinhood fork after other trades and a fee move, 2.75; the excess alone, claims kept, ~1.37. Later, it
 depends on the price the market left. `script/launch.sh recover` (`END_CLAIMS=1` for the reserve too) queues it, `recover-exec` runs it.
 
-## Perps: what the engine (its own audit and deploy, later) must respect
+## Perps, live from the launch
 
-- The pool is spot-only until the timelock wires an engine (`setPerpEngine`). Then every swap that isn't the engine's
-  own calls its sweep first; a sweep that can't run reverts the swap (no bad debt outranks always-tradeable), so a
-  broken engine halts trading until the timelock (12h) sets `sweepFailOpen` or unwires it.
+`src/perps/`: PerpEngine and PerpVault (ported from MiFrens Cauldron's audited engine, the IMD6900 rules: 6.9% open fee
+on collateral, 2-5x, no bad debt by construction), with PerpSwapLib inlined (no DELEGATECALL anywhere). The engine's
+constructor binds to the live pool, so it can't exist before the coin: `IMD6900LockedPool.createPerps(engineCode,
+vaultCode)` creates it right after `launch()` (anyone, once; `script/launch.sh perps`), only from exactly this source
+(`ENGINE_CODE_HASH`, `VAULT_CODE_HASH`; test_ThePerpsCodeIsTheAuditedCode), with the ETH sent as insurance; the
+Robinhood timelock owns the engine from that same transaction and the hook serves it at once (`initPerpEngine`), so
+perps trade from the first block after the launch. Every later change is the timelock's (24h).
+
+- Fees: open fee and liquidation penalty split 20% stakers (the vault), 10% insurance, 70% to the launch, which sends
+  it all as ETH to the NFT floor pot (`setFees`, `setVaultSplit`: the timelock's to change). The engine's pool fee comes
+  straight back (refund), so traders pay only the open fee: a 5x long opened and closed returns its collateral less
+  6.9%, on live Robinhood state too.
+- Liquidations: before every swap that isn't the engine's own, the hook has the engine close every position the swap
+  would sink, at the price before it moves (a whale's dump liquidates the long first: no bad debt, stakers whole, the
+  sender of the swap takes the keeper's cut). A sweep that can't run reverts the swap; the timelock (24h) can set
+  `sweepFailOpen` or unwire the engine.
 - The engine is bound to its pool for good, so `lowerFee` refuses while it has positions open (or can't say); after a
-  move it fails closed until the timelock wires a new engine for the new pool.
-- The locked position holds no liquidity below the opening price: the coin can't trade under the opening market cap,
-  and sells past it fill partly. The engine's no-bad-debt pricing must treat that edge as zero depth.
+  move it fails closed until the timelock wires a new one.
+- Liquidity for perps is the community's: ETH stakers (longs borrow it), token stakers (shorts borrow it), in PerpVault.
 
 ## The liquidity: locked, its fees not
 
@@ -91,17 +103,17 @@ it is as good as burned. What it earns isn't locked: `collect()` (or `harvest()`
 ## Red flags, and why there are none
 
 Plain coin (nothing anyone can change), the liquidity locked by construction (no remove path exists), the hook not
-upgradeable and owned by the 12h timelock, the opening buy in the same transaction as the pool (no snipe window), the
+upgradeable and owned by the timelock (24h), the opening buy in the same transaction as the pool (no snipe window), the
 bought coins in a contract (the claims' reserve) or burned, never in a wallet. Owner powers left on the launch: the
 claim list before the launch, releasing the unclaimed reserve after the claim deadline (≥ 90 days), the
-IMDSTR the claims collected. The timelock (12h, public) wires the perps engine (an engine is called before every swap,
+IMDSTR the claims collected. The timelock (24h, public) wires the perps engine (an engine is called before every swap,
 so it goes in only behind the delay), lowers the fee, sets the split, and can sell the coins the launch holds back for
-the opening buy's ETH or end the claims early: each visible 12h before it runs.
+the opening buy's ETH or end the claims early: each visible 24h before it runs.
 
 ## Tests
 
 ```sh
-forge test                                         # 44 tests, offline: admission, the 0x6900 coin, launch, pool, fees, refunds, the fee's move (never with perps open), $IMD burn, perps fees, claims, the ETH back
+forge test                                         # 53 tests, offline: admission, the 0x6900 coin, launch, pool, fees, refunds, the fee's move (never with perps open), $IMD burn, claims, the ETH back; the perps (creation, code hash, longs, shorts, the sweep's liquidations, fees)
 ROBINHOOD_RPC_URL=https://rpc.mainnet.chain.robinhood.com forge test --match-contract RobinhoodFork -vv
 ```
 
@@ -119,13 +131,14 @@ team wallet's keystore (`imdstr-deployer`); `script/launch.sh status` shows wher
 2. `deploy`: the launch contract (its constructor creates the locked pool), or `use <addr>`: the swarm's.
    Then `hook`: the hook's salt mined for that address (`cast create2`), and `createHook(salt)`.
 3. `claims`: the claim list from live balances capped at the snapshot (35 holders, ~63.9M), deadline in 120 days.
-4. `queue-claims`, then `open-claims` 12h later: the timelock makes the launch an IMDSTR distributor.
+4. `timelock-24h` (once: the Robinhood timelock's delay from 12h to 24h, itself through the timelock), `queue-claims`,
+   then `open-claims` one delay later: the timelock makes the launch an IMDSTR distributor.
 5. `mine`: the coin's 0x6900… address for this launch.
 6. Either `direct` (live on Uniswap in one transaction), or `programmable` (plan built from the exact source, packed with
    Programmable's packer, preflighted), `submit` (their manual review, up to 24h), `review`, then the team wallet signs
    `launch` in the approved 24h window, then the stamp.
 
-7. After it: `pot` whenever fees have piled up (harvest, $IMD burn, bridge, Ethereum deposit); `recover` /
+7. Right after it: `perps` (the engine and vault, live at once). Then `pot` whenever fees have piled up (harvest, $IMD burn, bridge, Ethereum deposit); `recover` /
    `recover-exec` if the opening buy's ETH should come back.
 
 Rehearsed end to end, both ways, on forks of Robinhood (`SIGN_ARGS="--unlocked --from <team>" RPC=<fork>`).

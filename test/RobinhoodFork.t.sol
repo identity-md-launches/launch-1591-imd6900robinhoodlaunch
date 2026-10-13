@@ -14,6 +14,8 @@ import {FullMath} from "@uniswap/v4-core/src/libraries/FullMath.sol";
 import {IMD6900RobinhoodLaunch} from "../src/IMD6900RobinhoodLaunch.sol";
 import {IMD6900LockedPool} from "../src/IMD6900LockedPool.sol";
 import {HookSalt, CoinSalt} from "./HookSalt.sol";
+import {PerpEngine} from "../src/perps/PerpEngine.sol";
+import {PerpVault} from "../src/perps/PerpVault.sol";
 
 interface IERC20 {
     function balanceOf(address) external view returns (uint256);
@@ -163,8 +165,30 @@ contract RobinhoodForkTest is Test {
         assertEq(pool.liquidity(), locked, "the position never moved");
         assertEq(inPool, locked, "and it is all the pool has");
 
+        // the perps, created right after the launch from the audited code (by hash), live at once, fee-free by refund
+        vm.deal(address(this), 1 ether);
+        (address e, address v) = pool.createPerps{value: 0.05 ether}(type(PerpEngine).creationCode, type(PerpVault).creationCode);
+        PerpEngine engine = PerpEngine(payable(e));
+        assertEq(engine.owner(), TL);
+        vm.deal(address(0x57A4E), 5 ether);
+        vm.prank(address(0x57A4E));
+        PerpVault(payable(v)).depositEth{value: 3 ether}();
+        address alice = address(0xA11CE5);
+        vm.deal(alice, 1 ether);
+        vm.prank(alice);
+        uint256 id = engine.openLong{value: 0.05 ether}(5, 0);
+        vm.prank(alice);
+        engine.close(id, 0);
+        emit log_named_decimal_uint("a 0.05 ETH 5x long, opened and closed on live state: back", alice.balance - 0.95 ether, 18);
+        assertGe(alice.balance - 0.95 ether, 0.046 ether, "the collateral less the 6.9% open fee: no pool fee");
+        assertEq(engine.openCount(), 0);
+        uint256 potPerps = POT.balance;
+        engine.flushFees();
+        assertGt(POT.balance, potPerps, "the perps' fees to the pot bridge");
+
         // the timelock lowers the fee: the position moves to a 3.33% pool at the same price, in one transaction
         uint256 potBefore2 = POT.balance;
+        (sq1,,) = pool.state(); // the price the perps round trip left
         vm.prank(TL);
         uint128 moved = pool.lowerFee(33_300);
         PoolKey memory k2 = pool.poolKey();

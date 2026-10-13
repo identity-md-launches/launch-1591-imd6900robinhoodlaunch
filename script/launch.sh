@@ -9,9 +9,12 @@
 #   script/launch.sh use <addr>    or adopt the one the IMD swarm deployed (checked: the team wallet's, this source, unlaunched)
 #   script/launch.sh hook          the hook: its salt mined for this launch (cast create2), then createHook(salt)
 #   script/launch.sh claims        the claim list (script/claims.py: live balances capped at the snapshot), deadline in 120 days
-#   script/launch.sh queue-claims  queues the timelock's IMDSTR.setDistributor(<launch>, true): claims open 12h later
+#   script/launch.sh queue-claims  queues the timelock's IMDSTR.setDistributor(<launch>, true): claims open one timelock delay later (24h once timelock-24h ran)
 #   script/launch.sh open-claims   executes it once ready (anyone with the executor role; the team wallet has it)
 #   script/launch.sh mine          the coin's 0x6900… address for this launch (PREFIX=69006900 for a longer one)
+#   script/launch.sh timelock-24h  queues the Robinhood timelock's delay to 24h (through itself); run again to execute it
+#   script/launch.sh perps         right after the launch: the perps engine and vault (the audited code, by hash),
+#                                  owned by the timelock, wired into the hook at once (INSURANCE ETH, default 0.05)
 #   script/launch.sh direct        launch() now: the coin, the locked pool, the opening buy (BUY_ETH, default 2.81)
 #   script/launch.sh programmable  the Programmable plan for the same launch(): built, packed and preflighted
 #   script/launch.sh submit        creates it on Programmable (their manual review starts), then `review` polls it
@@ -23,7 +26,7 @@
 #                                  depositBridgedFees (what Across delivered joins the NFT pot). ETH_RPC_URL for Ethereum.
 #   script/launch.sh recover       after the launch, the opening buy's ETH back: queues on the timelock the sale of the coins
 #                                  the launch holds (END_CLAIMS=1: the unclaimed reserve too, claims end) to the team wallet
-#   script/launch.sh recover-exec  runs it once the 12h delay is over
+#   script/launch.sh recover-exec  runs it once the timelock's delay is over
 #
 # Signs with the imdstr-deployer keystore (the team wallet); SIGN_ARGS="--unlocked --from <team>" on a fork.
 set -euo pipefail
@@ -55,6 +58,7 @@ m() { python3 -c "print(f'{$1/1e24:.2f}M')"; }
 claims_data() { cast calldata 'setDistributor(address,bool)' "$LAUNCH" true; }
 claims_op() { c $TL 'hashOperation(address,uint256,bytes,bytes32,bytes32)(bytes32)' $IMDSTR 0 "$(claims_data)" $ZERO "$CLAIMS_SALT"; }
 need() { [ -n "${!1:-}" ] || { echo "no $1 yet: run '$2' first"; exit 1; }; }
+delay() { c $TL 'getMinDelay()(uint256)'; }  # the timelock's delay, read live (12h today, 24h after timelock-24h)
 # launch() buys with every wei the launch holds: anything already there would push the price past Ethereum's
 emptied() { [ "$(cast balance $LAUNCH --rpc-url "$RPC")" = 0 ] || { echo "the launch holds ETH already: the owner's withdrawEth first, so the buy is exactly params.py's"; exit 1; }; }
 hooked() { [ "$(c $LAUNCH 'hook()(address)')" != 0x0000000000000000000000000000000000000000 ] || { echo "no hook yet: run 'hook' first"; exit 1; }; }
@@ -115,8 +119,9 @@ case "${1:-status}" in
     ;;
   queue-claims)
     need LAUNCH deploy
-    tx $TL 'schedule(address,uint256,bytes,bytes32,bytes32,uint256)' $IMDSTR 0 "$(claims_data)" $ZERO "$CLAIMS_SALT" 43200
-    echo "queued $(claims_op): ready in 12h (open-claims)"
+    D=$(delay)
+    tx $TL 'schedule(address,uint256,bytes,bytes32,bytes32,uint256)' $IMDSTR 0 "$(claims_data)" $ZERO "$CLAIMS_SALT" $D
+    echo "queued $(claims_op): ready in $((D / 3600))h (open-claims)"
     ;;
   open-claims)
     need LAUNCH deploy
@@ -183,6 +188,32 @@ PY
 import json; d=json.load(open('review.json')); print(json.dumps({k: d.get(k) for k in ('status','manualReview','walletUrl','continuation')}, indent=1)[:2000])"
     "$0" drift || true
     ;;
+  timelock-24h)
+    D=$(delay); [ "$D" -ge 86400 ] && { echo "the timelock's delay is already ${D}s"; exit 0; }
+    UD=$(cast calldata 'updateDelay(uint256)' 86400); TS=$(cast keccak "imd6900-rh-timelock-24h")
+    OP=$(c $TL 'hashOperation(address,uint256,bytes,bytes32,bytes32)(bytes32)' $TL 0 $UD $ZERO $TS)
+    if [ "$(c $TL 'isOperation(bytes32)(bool)' $OP)" != true ]; then
+      tx $TL 'schedule(address,uint256,bytes,bytes32,bytes32,uint256)' $TL 0 $UD $ZERO $TS $D
+      echo "queued $OP: the timelock's delay to 24h, executable in $((D / 3600))h (run timelock-24h again then)"
+    elif [ "$(c $TL 'isOperationReady(bytes32)(bool)' $OP)" = true ]; then
+      tx $TL 'execute(address,uint256,bytes,bytes32,bytes32)' $TL 0 $UD $ZERO $TS && echo "the timelock's delay is now $(delay)s"
+    else echo "queued, not ready yet"; fi
+    ;;
+  perps)
+    need LAUNCH deploy
+    [ "$(c $LAUNCH 'token()(address)')" != 0x0000000000000000000000000000000000000000 ] || { echo "launch first: the engine binds to the live pool"; exit 1; }
+    P=$(c $LAUNCH 'pool()(address)')
+    E=$(c $P 'perpsEngine()(address)')
+    [ "$E" = 0x0000000000000000000000000000000000000000 ] || { echo "perps: engine $E, vault $(c $P 'perpsVault()(address)')"; exit 0; }
+    forge build --silent
+    EC=$(python3 -c "import json;print(json.load(open('out/PerpEngine.sol/PerpEngine.json'))['bytecode']['object'])")
+    VC=$(python3 -c "import json;print(json.load(open('out/PerpVault.sol/PerpVault.json'))['bytecode']['object'])")
+    [ "$(cast keccak $EC)" = "$(c $P 'ENGINE_CODE_HASH()(bytes32)')" ] && [ "$(cast keccak $VC)" = "$(c $P 'VAULT_CODE_HASH()(bytes32)')" ] \
+      || { echo "this checkout doesn't build the perps code the pool was deployed for: check out the launch's commit"; exit 1; }
+    tx $P 'createPerps(bytes,bytes)' $EC $VC --value "${INSURANCE:-0.05}ether" --gas-limit 15000000
+    E=$(c $P 'perpsEngine()(address)')
+    echo "perps live: engine $E (owner $(c $E 'owner()(address)')), vault $(c $P 'perpsVault()(address)'); the hook serves $(c $(c $LAUNCH 'hook()(address)') 'perpEngine()(address)')"
+    ;;
   pot)
     need LAUNCH deploy
     [ "$(c $LAUNCH 'token()(address)')" != 0x0000000000000000000000000000000000000000 ] || { echo "not launched yet"; exit 1; }
@@ -210,7 +241,7 @@ import json; d=json.load(open('review.json')); print(json.dumps({k: d.get(k) for
     if [ "${END_CLAIMS:-0}" = 1 ] && [ "$RESERVE" != 0 ]; then AMOUNT=$(python3 -c "print($HELD + $RESERVE)"); fi
     # the sale's quote at today's price (the position's one range, so a constant product; the sale is refunded, so
     # fee-free but for 4.44% cubed left held): the floor under it is
-    # SLIPPAGE percent (default 5: the price moves in 12h; MIN_ETH sets it outright)
+    # SLIPPAGE percent (default 5: the price moves during the delay; MIN_ETH sets it outright)
     read -r SQ _ LIQ < <(cast call $(c $LAUNCH 'pool()(address)') 'state()(uint160,int24,uint128)' --rpc-url "$RPC" | awk '{print $1}' | xargs)
     FEE=$(c $(c $LAUNCH 'pool()(address)') 'fee()(uint24)')
     QUOTE=$(python3 -c "
@@ -221,9 +252,9 @@ q=2**96; sq,l,dy=$SQ,$LIQ,$AMOUNT*(1-($FEE/1e6)**3); sq2=sq+dy*q/l; print(int(l*
       TARGETS="[$LAUNCH,$LAUNCH]"; DATAS="[$(cast calldata 'endClaims()'),$(cast calldata 'sellHeld(uint256,uint256,address)' 0 $MIN $TEAM)]"
     fi
     SALT=$(cast keccak "imd6900-rh-recover-$(date +%s)")
-    tx $TL 'scheduleBatch(address[],uint256[],bytes[],bytes32,bytes32,uint256)' "$TARGETS" "$(echo "$TARGETS" | sed -E 's/0x[0-9a-fA-F]{40}/0/g')" "$DATAS" $ZERO $SALT 43200
+    tx $TL 'scheduleBatch(address[],uint256[],bytes[],bytes32,bytes32,uint256)' "$TARGETS" "$(echo "$TARGETS" | sed -E 's/0x[0-9a-fA-F]{40}/0/g')" "$DATAS" $ZERO $SALT $(delay)
     save RECOVER_TARGETS "$TARGETS"; save RECOVER_DATAS "$DATAS"; save RECOVER_SALT "$SALT"
-    echo "queued: sell $(m $AMOUNT) back for ~$(e $QUOTE) ETH today (floor $(e $MIN)) to the team wallet$([ "${END_CLAIMS:-0}" = 1 ] && echo ', claims ended first'); recover-exec in 12h"
+    echo "queued: sell $(m $AMOUNT) back for ~$(e $QUOTE) ETH today (floor $(e $MIN)) to the team wallet$([ "${END_CLAIMS:-0}" = 1 ] && echo ', claims ended first'); recover-exec in $(( $(delay) / 3600 ))h"
     ;;
   recover-exec)
     need RECOVER_SALT recover
@@ -234,5 +265,5 @@ q=2**96; sq,l,dy=$SQ,$LIQ,$AMOUNT*(1-($FEE/1e6)**3); sq2=sq+dy*q/l; print(int(l*
     tx $TL 'executeBatch(address[],uint256[],bytes[],bytes32,bytes32)' "$RECOVER_TARGETS" "$VALUES" "$RECOVER_DATAS" $ZERO $RECOVER_SALT
     echo "back to the team wallet: $(e $(python3 -c "print($(cast balance $TEAM --rpc-url "$RPC") - $B0)")) ETH (less its gas)"
     ;;
-  *) sed -n 2,27p "$0"; exit 1 ;;
+  *) sed -n 2,31p "$0"; exit 1 ;;
 esac
