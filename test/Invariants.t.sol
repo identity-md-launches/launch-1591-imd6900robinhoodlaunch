@@ -65,6 +65,11 @@ contract LaunchHandler is Test {
     uint256 public ghostPayeeRefused; // the refuser's share, booked as owed
     bool public ghostClaimsEnded;
     uint24 public ghostLastFee = 44_400;
+    uint256 public ghostImdBuys;
+    uint256 public ghostBucketIn; // what split() set aside for the $IMD burn
+    uint256 public ghostBucketOut; // what burnImd took out of it
+    uint256 public ghostPerpFeesForwarded; // perps fees that reached perpFeeTo
+    uint256 public ghostPerpFeesBooked; // perps fees perpFeeTo refused, booked for it (counted once each)
 
     constructor(
         IPoolManager pm,
@@ -140,9 +145,73 @@ contract LaunchHandler is Test {
         uint256 bucket = L.imdBucket();
         if (bucket == 0) return;
         uint256 spend = bucket < L.IMD_BUY_MAX() ? bucket : L.IMD_BUY_MAX();
+        uint256 before = address(L).balance;
         try L.burnImd(0) {
-            ghostEthToPayees += spend;
-        } catch {}
+            // the bucket is debited by what the pool took, never more than offered, and that is what left the launch
+            uint256 took = bucket - L.imdBucket();
+            assertLe(took, spend, "burnImd spent more than its cap");
+            assertEq(before - address(L).balance, took, "the bucket and the balance disagree on the buy");
+            ghostEthToPayees += took;
+            ghostBucketOut += took;
+            ++ghostImdBuys;
+            // one buy a timestamp: the same call again in this block is refused, whatever is left in the bucket
+            vm.expectRevert(IMD6900RobinhoodLaunch.BoughtThisBlock.selector);
+            L.burnImd(0);
+        } catch (bytes memory err) {
+            // only the gate: a bucket this handler found non-empty is otherwise always spendable
+            assertEq(bytes4(err), IMD6900RobinhoodLaunch.BoughtThisBlock.selector, "burnImd failed for another reason");
+            assertEq(L.lastImdBuy(), block.timestamp, "BoughtThisBlock without a buy this timestamp");
+        }
+    }
+
+    /*                        THE PERPS' FEE FORWARDING                      */
+
+    /// The engine's fees reach {perpFeeTo}; what it refuses is booked and never lost to the split
+    function flushFees() external {
+        uint256 owed = engine.feesOwed();
+        if (owed == 0) return;
+        uint256 bookedBefore = L.perpFeesOwed();
+        uint256 toBefore = L.perpFeeTo().balance;
+        uint256 flushed = engine.flushFees();
+        assertEq(flushed, owed);
+        _checkForwarding(flushed, bookedBefore, toBefore);
+    }
+
+    /// Anyone may pay perps fees in (as the engine does); the same forwarding, the same booking
+    function addPerpFees(uint256 eth) external {
+        eth = bound(eth, 0, 0.5 ether);
+        address a = address(traders[0]);
+        vm.deal(a, a.balance + eth);
+        uint256 bookedBefore = L.perpFeesOwed();
+        uint256 toBefore = L.perpFeeTo().balance;
+        vm.prank(a);
+        L.addPerpFees{value: eth}();
+        _checkForwarding(eth, bookedBefore, toBefore);
+    }
+
+    /// The timelock points the perps' fees at the refuser, a payee or the pot; nobody else can
+    function setPerpFeeTo(uint256 pick) external {
+        uint256 which = bound(pick, 0, 2);
+        address to = which == 0 ? REFUSER : which == 1 ? PAYEE : L.POT_BRIDGE();
+        vm.prank(OWNER);
+        vm.expectRevert(IMD6900RobinhoodLaunch.NotTimelock.selector);
+        L.setPerpFeeTo(to);
+        vm.prank(TL);
+        L.setPerpFeeTo(to);
+    }
+
+    function refuserOpens(bool open) external {
+        Refuser(payable(REFUSER)).setOpen(open);
+    }
+
+    /// Nobody renounces the launch: not its owner, not the timelock
+    function renounce() external {
+        vm.prank(OWNER);
+        vm.expectRevert(IMD6900RobinhoodLaunch.NoRenounce.selector);
+        L.renounceOwnership();
+        vm.prank(TL);
+        vm.expectRevert(IMD6900RobinhoodLaunch.NoRenounce.selector);
+        L.renounceOwnership();
     }
 
     /*                               CLAIMS                                 */
@@ -348,11 +417,6 @@ contract LaunchHandler is Test {
         try vault.withdrawToken(bound(frac, 1, shares)) {} catch {}
     }
 
-    function flushFees() external {
-        if (engine.feesOwed() == 0) return;
-        engine.flushFees();
-    }
-
     function claimPayout(uint256 who) external {
         address a = address(traders[bound(who, 0, traders.length - 1)]);
         if (engine.payoutOwed(a) == 0) return;
@@ -444,10 +508,36 @@ contract LaunchHandler is Test {
     function _split() internal {
         uint256 before = address(L).balance;
         uint256 owedBefore = L.owedTotal();
+        uint256 bucketBefore = L.imdBucket();
+        uint256 perpBooked = L.perpFeesOwed();
         L.split();
         uint256 paid = before - address(L).balance;
         ghostEthToPayees += paid;
         if (L.owedTotal() > owedBefore) ghostPayeeRefused += L.owedTotal() - owedBefore;
+        if (L.imdBucket() > bucketBefore) ghostBucketIn += L.imdBucket() - bucketBefore;
+        // the split never touches what the perps' destination is owed, nor pays it out to the payees
+        assertEq(L.perpFeesOwed(), perpBooked, "split moved the perps' book");
+        assertGe(address(L).balance, L.imdBucket() + L.owedTotal() + perpBooked, "split paid out the perps' book");
+    }
+
+    /// After a forwarding of `paid` new wei: either everything (the new and the booked) reached perpFeeTo and the
+    /// book is clear, or the destination refused, nothing left the launch and the book grew by exactly `paid`
+    function _checkForwarding(uint256 paid, uint256 bookedBefore, uint256 toBefore) internal {
+        address to = L.perpFeeTo();
+        uint256 booked = L.perpFeesOwed();
+        if (paid + bookedBefore == 0) {
+            assertEq(booked, 0, "booked out of nothing");
+            return;
+        }
+        if (booked == 0) {
+            assertEq(to.balance - toBefore, paid + bookedBefore, "perpFeeTo got less than the new and the booked");
+            ghostPerpFeesForwarded += paid + bookedBefore;
+        } else {
+            assertEq(to, REFUSER, "a destination that accepts was booked");
+            assertEq(to.balance, toBefore, "the refuser was paid");
+            assertEq(booked, bookedBefore + paid, "the book is not the old book plus what came in");
+            ghostPerpFeesBooked += paid;
+        }
     }
 
     function _countSweep(bytes memory err) internal {
@@ -587,14 +677,24 @@ contract LaunchInvariantTest is Test {
         else assertEq(L.claimReserve(), L.claimTotal() - L.claimedTotal());
     }
 
-    /// The ETH the launch holds covers what it has set aside: the $IMD bucket and what refused payees are owed
+    /// The ETH the launch holds covers what it has set aside: the $IMD bucket, what refused payees are owed and the
+    /// perps fees their destination refused
     function invariant_TheLaunchHoldsTheEthItBooked() public view {
-        assertGe(address(L).balance, L.imdBucket() + L.owedTotal(), "booked more ETH than held");
+        assertGe(address(L).balance, L.imdBucket() + L.owedTotal() + L.perpFeesOwed(), "booked more ETH than held");
         assertEq(
             L.owed(address(refuser)) + L.owed(POT) + L.owed(PAYEE) + L.owed(L.imdBurn()),
             L.owedTotal(),
             "owedTotal is not the sum of what is owed"
         );
+        // the bucket only ever holds what the split set aside, so a refused perps fee never feeds the $IMD buy
+        assertLe(L.imdBucket(), handler.ghostBucketIn() - handler.ghostBucketOut(), "the bucket grew outside split");
+    }
+
+    /// The launch's owner and the timelock's roles never move: no renounce, no transfer the handler didn't make
+    function invariant_TheRolesStay() public view {
+        assertEq(L.owner(), OWNER, "the launch lost or changed its owner");
+        assertEq(L.timelock(), TL);
+        assertEq(engine.feeSink(), address(L), "the engine's fees go somewhere else than the launch");
     }
 
     /// The coin's fee never goes to a person: the pool holds nothing between collects but what it will pay out,
@@ -656,6 +756,12 @@ contract LaunchInvariantTest is Test {
             handler.ghostEthToPayees(),
             handler.ghostPayeeRefused(),
             engine.openCount()
+        );
+        console2.log(
+            "imd buys / perp fees forwarded / booked",
+            handler.ghostImdBuys(),
+            handler.ghostPerpFeesForwarded(),
+            handler.ghostPerpFeesBooked()
         );
     }
 

@@ -18,7 +18,7 @@ import {IMD6900Hook} from "../src/IMD6900Hook.sol";
 import {IMD6900LockedPool} from "../src/IMD6900LockedPool.sol";
 import {IMD6900RobinhoodLaunch} from "../src/IMD6900RobinhoodLaunch.sol";
 import {HookSalt, CoinSalt} from "./HookSalt.sol";
-import {MockImdstr, Trader, RefundingEngine, IERC20} from "./IMD6900RobinhoodLaunch.t.sol";
+import {MockImdstr, Trader, RefundingEngine, Refuser, IERC20} from "./IMD6900RobinhoodLaunch.t.sol";
 
 /// The inputs the happy path did not consider: zero, one wei, the whole supply, the maximum, the same call twice,
 /// a caller who is not who the code assumed; and the arithmetic fuzzed at its edges.
@@ -476,6 +476,80 @@ contract EdgesTest is Test {
         assertEq(TL.balance, 0.1 ether);
         assertEq(L.imdBucket(), 0);
         assertEq(address(L).balance, 0);
+    }
+
+    /// The perps' book (what their destination refused) is kept apart from the split and the bucket: a recovery that
+    /// leaves enough for it keeps it, one that doesn't cancels it along with the payees' book, and the bucket is
+    /// cut last
+    function test_TheRefusedPerpsBookAndRecoverEth() public {
+        _launch();
+        Refuser refuser = new Refuser();
+        vm.prank(TL);
+        L.setPerpFeeTo(address(refuser));
+        vm.deal(address(this), 2 ether);
+        L.addPerpFees{value: 1 ether}();
+        assertEq(L.perpFeesOwed(), 1 ether, "refused, so booked");
+        assertEq(address(L).balance, 1 ether, "and kept");
+        // a split with more ETH in: the book is not split, not bucketed
+        vm.deal(address(L), 2 ether);
+        assertEq(L.split(), 1 ether, "only what is beyond the book is split");
+        assertEq(L.perpFeesOwed(), 1 ether);
+        assertEq(L.imdBucket(), 0.1 ether);
+        assertEq(POT.balance, 0.9 ether);
+        assertEq(address(L).balance, 1.1 ether);
+        // recover what leaves the book and the bucket covered: both stay
+        vm.deal(address(L), 1.5 ether);
+        vm.prank(TL);
+        L.recoverEth(R, 0.4 ether);
+        assertEq(L.perpFeesOwed(), 1 ether, "a recovery that leaves enough keeps the book");
+        assertEq(L.imdBucket(), 0.1 ether);
+        // recover past it: the book is cancelled before the bucket, and the bucket is cut to what is left
+        vm.prank(TL);
+        L.recoverEth(R, 1.05 ether);
+        assertEq(address(L).balance, 0.05 ether);
+        assertEq(L.perpFeesOwed(), 0, "the book is gone with the recovery");
+        assertEq(L.imdBucket(), 0.05 ether, "the bucket shrinks to what is left");
+        // the destination opening now finds nothing owed: a forwarding of nothing is a no-op, not a revert
+        refuser.setOpen(true);
+        L.addPerpFees();
+        assertEq(address(refuser).balance, 0);
+        assertEq(L.perpFeesOwed(), 0);
+        assertEq(address(L).balance, 0.05 ether);
+    }
+
+    /// addPerpFees from anyone: zero with nothing booked is a no-op, a payment is forwarded with the book on top,
+    /// and a refusal books only what came in (the launch's other ETH is never offered)
+    function test_AddPerpFeesByAStranger() public {
+        _launch();
+        Refuser refuser = new Refuser();
+        vm.deal(address(L), 1 ether); // the coin's fees, waiting for a split
+        address stranger = address(0x5712);
+        vm.deal(stranger, 1 ether);
+        vm.prank(stranger);
+        L.addPerpFees(); // nothing in, nothing booked: nothing happens
+        assertEq(L.perpFeesOwed(), 0);
+        assertEq(address(L).balance, 1 ether);
+        vm.prank(TL);
+        L.setPerpFeeTo(address(refuser));
+        vm.prank(stranger);
+        L.addPerpFees{value: 0.3 ether}();
+        assertEq(L.perpFeesOwed(), 0.3 ether, "only what came in is booked");
+        assertEq(address(L).balance, 1.3 ether, "the fees waiting for the split are untouched");
+        refuser.setOpen(true);
+        vm.prank(stranger);
+        L.addPerpFees{value: 0.2 ether}();
+        assertEq(address(refuser).balance, 0.5 ether, "the new and the booked, together");
+        assertEq(L.perpFeesOwed(), 0);
+        assertEq(address(L).balance, 1 ether, "the split's ETH never went with it");
+        assertEq(L.split(), 1 ether);
+    }
+
+    /// One $IMD buy a timestamp, even when the first was refused for an empty bucket: the gate is set only by a buy
+    function test_TheImdBuyGateIsSetOnlyByABuy() public {
+        _launch();
+        vm.expectRevert(IMD6900RobinhoodLaunch.NoEth.selector);
+        L.burnImd(0); // an empty bucket reverts the whole call: the gate is not set
+        assertEq(L.lastImdBuy(), 0);
     }
 
     /*                               HELPERS                                */
