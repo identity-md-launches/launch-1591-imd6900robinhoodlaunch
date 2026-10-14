@@ -1,0 +1,15 @@
+{
+  "kind": "evm_contracts",
+  "contracts": [
+    {
+      "contract": "IMD6900RobinhoodLaunch",
+      "constructorArgs": [
+        "$owner",
+        "0x8366a39CC670B4001A1121B8F6A443A643e40951",
+        "0x0000198C940D8cD70Cb9ACeC5E3af8216ac57d2F",
+        "0x16D3f65B708883DF042d98E1C7a49B32A33E2A14"
+      ]
+    }
+  ],
+  "notes": "One contract on Robinhood Chain (chain id 4663): IMD6900RobinhoodLaunch (src/IMD6900RobinhoodLaunch.sol), exactly as in the repository (solc 0.8.26, via-IR, 200 runs, cancun, bytecode_hash none). Constructor (owner_, poolManager_, imdstr_, timelock_): $owner resolves to the team wallet 0x35da9c0303507ddf708e87f2568eddf12c47a059, which owns the launch (setClaims, launch, withdrawEth before the launch); 0x8366a39CC670B4001A1121B8F6A443A643e40951 is Uniswap v4's PoolManager on Robinhood Chain; 0x0000198C940D8cD70Cb9ACeC5E3af8216ac57d2F is Robinhood's IMDSTR, the old token whose holders claim IMD6900 1:1; 0x16D3f65B708883DF042d98E1C7a49B32A33E2A14 is the Robinhood timelock, which owns the hook and the perps engine and alone recovers ETH, releases the excess, sells the held coins (sellHeld), ends the claims early (endClaims), sets the fee split and its landing addresses (setPayees, setPerpFeeTo, setCoinFeeTo, setImdBurn, setImdPool) and lowers the pool fee (IMD6900LockedPool.lowerFee, lower only, refused while the perps engine has open positions). The constructor creates IMD6900LockedPool (static 4.44% fee, POOL_FEE 44_400) and nothing else, calls nothing that existed before it, and takes about 6.9M gas from any deployer (no salt mining). Not deployed here: IMD6900Hook is created later by createHook(salt) (anyone, once) with CREATE2 from the launch at a salt the team mines off-chain (script/launch.sh hook) so its address carries exactly the hook's permission flags and does not start with 0x91; IMD6900 (the coin, plain ERC20, 1B supply) and the locked coin-only pool position are created by launch() at a 0x6900... address mined for the launch contract; PerpEngine and PerpVault are created right after launch() by IMD6900LockedPool.createPerps from the audited code pinned by ENGINE_CODE_HASH / VAULT_CODE_HASH and wired into the hook at once. Fee split defaults fixed in the code: 90% to the pot bridge (IMD6900's NFT floor pot on Ethereum), 10% $IMD bought for the canonical Robinhood burn executor 0x4D6537ec564aFf82eABb1Ce5f355E817cBEA1e07. No ETH is sent at deployment and no initialization call is needed."
+}
