@@ -12,7 +12,7 @@ and the old IMDSTR claims the new coin 1:1, up to each holder's snapshot balance
 | `src/IMD6900RobinhoodLaunch.sol` | What the swarm deploys. Its constructor creates the locked pool and calls nothing that existed before it (~6.9M gas, the same from any deployer). `createHook(salt)` (anyone, once) then creates the hook at a salt mined off-chain for its address. Then the launch, the claims, the fee split. |
 | `src/IMD6900.sol` | The coin: 1B minted once to the launch. No owner, no mint, no tax, no pause, no blacklist, no limits, no proxy. Holders can burn their own. |
 | `src/IMD6900LockedPool.sol` | Owns the pool's one position. No owner, no way to take liquidity out. `collect()` (anyone): ETH fees to the split, IMD6900 fees burned (or to `setCoinFeeTo`'s address). `lowerFee(fee)` (the timelock only, lower only, never with perps open): moves the position, in one transaction, into a new pool at the lower fee and the same price. `feeCheckpoint()` / `feeRefund(to)`: the perps engine and the launch's sale trade fee-free (below). |
-| `src/IMD6900Hook.sol` | ETH / IMD6900 only, at the locked pool's static fee, initialized by the locked pool only (at the launch, and at each lower fee it moves to), liquidity from it only. Charges nothing itself: no dynamic fee, no return deltas. In-pool perps: before every swap that isn't the engine's own, the engine (once the timelock wires one) liquidates every position the swap would sink, at the price before it moves; a best-effort second sweep after. Reports the pool's fee to the engine (`perpFeeBps`). Not upgradeable. Owned by the Robinhood timelock. |
+| `src/IMD6900Hook.sol` | ETH / IMD6900 only, at the locked pool's static fee, initialized by the locked pool only (at the launch, and at each lower fee it moves to), liquidity from it only. Charges nothing itself: no dynamic fee, no return deltas. In-pool perps: before every swap that isn't the engine's own, the engine (once the timelock wires one) liquidates every position the swap would sink, at the price before it moves; a best-effort second sweep after (not after the launch's own sale of held coins, which would lose the sale its fee refund). The engine can't be unwired or replaced while it reports positions open. Reports the pool's fee to the engine (`perpFeeBps`). Not upgradeable. Owned by the Robinhood timelock. |
 
 ## The launch, one transaction
 
@@ -90,7 +90,8 @@ perps trade from the first block after the launch. Every later change is the tim
 - Liquidations: before every swap that isn't the engine's own, the hook has the engine close every position the swap
   would sink, at the price before it moves (a whale's dump liquidates the long first: no bad debt, stakers whole, the
   sender of the swap takes the keeper's cut). A sweep that can't run reverts the swap; the timelock (24h) can set
-  `sweepFailOpen` or unwire the engine.
+  `sweepFailOpen` or unwire the engine (never while it reports positions open: only the wired engine trades fee-free,
+  so an unwired one's closes would revert and strand them; one that can't say is replaceable).
 - The engine is bound to its pool for good, so `lowerFee` refuses while it has positions open (or can't say); after a
   move it fails closed until the timelock wires a new one.
 - Liquidity for perps is the community's: ETH stakers (longs borrow it), token stakers (shorts borrow it), in PerpVault.

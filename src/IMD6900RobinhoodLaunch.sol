@@ -115,6 +115,11 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
     address[8] internal _payees;
     uint16[8] internal _shares;
     uint8 internal _payeeCount;
+    /// @notice ETH a payee refused ({split}): kept here for it and offered again with its next share, never divided
+    ///         among the others. Per payee, and their sum. Cancelled (divided again at the next split) only when the
+    ///         timelock drops the payee ({setPayees}) or recovers the ETH ({recoverEth}).
+    mapping(address => uint256) public owed;
+    uint256 public owedTotal;
 
     event HookCreated(address hook, bytes32 salt);
     event ClaimsSet(bytes32 root, uint256 total, uint256 deadline);
@@ -126,6 +131,7 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
     event FeesReceived(address indexed from, uint256 amount);
     event Split(uint256 amount);
     event PayFailed(address payee, uint256 amount);
+    event OwedCancelled(address payee, uint256 amount);
     event PayeesSet(address[] payees, uint16[] shares);
     event EthRecovered(address to, uint256 amount);
     event ExcessReleased(address to, uint256 amount);
@@ -331,6 +337,7 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
         if (msg.sender != timelock) revert NotTimelock();
         uint256 n = to.length;
         if (n == 0 || n > MAX_PAYEES || n != bps.length) revert BadPayees();
+        (address[] memory old,) = payees(); // before the new list replaces it
         uint256 sum;
         for (uint256 i; i < n; ++i) {
             if (to[i] == address(0)) revert BadPayees();
@@ -339,6 +346,14 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
         }
         if (sum != 10_000) revert BadPayees();
         _payeeCount = uint8(n);
+        // what a payee the new list drops was owed is cancelled: the next split divides it among the new payees
+        for (uint256 i; i < old.length; ++i) {
+            bool kept;
+            for (uint256 j; j < n && !kept; ++j) {
+                kept = to[j] == old[i];
+            }
+            if (!kept) _cancelOwed(old[i]);
+        }
         emit PayeesSet(to, bps);
     }
 
@@ -349,7 +364,13 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
         if (amount == 0) amount = address(this).balance;
         if (amount == 0) revert NoEth();
         SafeTransferLib.safeTransferETH(to, amount);
-        if (imdBucket > address(this).balance) imdBucket = address(this).balance;
+        uint256 left = address(this).balance;
+        if (imdBucket + owedTotal > left) {
+            // what was booked is gone with it: the payees' owed shares first, then what was set aside for $IMD
+            (address[] memory ps,) = payees();
+            for (uint256 i; i < ps.length; ++i) _cancelOwed(ps[i]);
+            if (imdBucket > left) imdBucket = left;
+        }
         emit EthRecovered(to, amount);
     }
 
@@ -399,6 +420,7 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
         if (msg.sender != timelock) revert NotTimelock();
         if (executor == address(0)) revert BadPayees();
         imdBurn = executor;
+        _cancelOwed(executor); // its share is set aside for {burnImd} from now on, not sent
         emit ImdBurnSet(executor);
     }
 
@@ -438,21 +460,33 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
 
     /// @notice Pays the ETH here (beyond what is set aside for $IMD) to the payees, pro rata; the burn executor's share
     ///         is set aside for {burnImd} instead. After the launch only. A payee that refuses its share leaves it here
-    ///         for the next split.
+    ///         for the next split, booked to it ({owed}): it is offered to that payee again, never divided among the
+    ///         others.
     function split() public nonReentrant returns (uint256 amount) {
         if (token == address(0)) revert NotLaunched();
-        amount = address(this).balance - imdBucket;
-        if (amount == 0) return 0;
+        amount = address(this).balance - imdBucket - owedTotal;
+        if (amount == 0 && owedTotal == 0) return 0;
         (address[] memory to, uint16[] memory bps) = payees();
         for (uint256 i; i < to.length; ++i) {
             uint256 part = (amount * bps[i]) / 10_000;
-            if (part == 0) continue;
             if (to[i] == imdBurn) {
                 imdBucket += part;
                 continue;
             }
-            (bool ok,) = to[i].call{value: part}("");
-            if (!ok) emit PayFailed(to[i], part);
+            uint256 due = owed[to[i]];
+            uint256 pay = part + due;
+            if (pay == 0) continue;
+            (bool ok,) = to[i].call{value: pay}("");
+            if (ok) {
+                if (due != 0) {
+                    owedTotal -= due;
+                    owed[to[i]] = 0;
+                }
+            } else {
+                owedTotal += part;
+                owed[to[i]] = pay;
+                emit PayFailed(to[i], pay);
+            }
         }
         emit Split(amount);
     }
@@ -521,6 +555,15 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
     }
 
     /*                              INTERNAL                                */
+
+    /// @dev Drops what `payee` was owed: the next split divides it among the payees of the day
+    function _cancelOwed(address payee) internal {
+        uint256 due = owed[payee];
+        if (due == 0) return;
+        owedTotal -= due;
+        owed[payee] = 0;
+        emit OwedCancelled(payee, due);
+    }
 
     function _hookInitCode() internal view returns (bytes memory) {
         return abi.encodePacked(type(IMD6900Hook).creationCode, abi.encode(poolManager, address(pool), timelock));

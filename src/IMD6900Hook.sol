@@ -20,6 +20,7 @@ interface ILockedPoolView {
     function token() external view returns (address);
     function upperTick() external view returns (int24);
     function fee() external view returns (uint24);
+    function launcher() external view returns (address);
 }
 
 /// @notice The perps engine, once there is one: liquidates every position a trade would sink, before it runs
@@ -74,6 +75,9 @@ contract IMD6900Hook is BaseHook, Ownable {
     error SweepUnavailable();
     error NoRenounce();
     error EngineSet();
+    /// @notice The wired engine reports positions open: its closes and liquidations trade fee-free only while it is the
+    ///         wired engine (IMD6900LockedPool.isRefunded), so unwiring it would strand them
+    error PerpsOpen();
 
     /// @param owner_ the Robinhood timelock: the engine and the escape hatch wait out its delay
     constructor(IPoolManager poolManager_, address pool_, address owner_) BaseHook(poolManager_) {
@@ -120,8 +124,15 @@ contract IMD6900Hook is BaseHook, Ownable {
     /*                       OWNER (the Robinhood timelock)                  */
 
     /// @dev Replaceable: an engine whose sweep can never run blocks trading (fail closed), so the owner keeps the way
-    ///      out, behind the timelock. Zero turns perps off.
+    ///      out, behind the timelock. Zero turns perps off. Never while the wired engine reports positions open: they
+    ///      close through it, and only the wired engine's swaps are refunded (so an unwired engine's closes revert).
+    ///      An engine that can't say how many it holds is replaceable: that is the broken wiring this is the way out of.
     function setPerpEngine(address engine) external onlyOwner {
+        address cur = perpEngine;
+        if (cur != address(0) && cur != engine) {
+            (, bool open) = _openPositions(cur);
+            if (open) revert PerpsOpen();
+        }
         perpEngine = engine;
         emit PerpEngineSet(engine);
     }
@@ -202,13 +213,17 @@ contract IMD6900Hook is BaseHook, Ownable {
         return (BaseHook.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
     }
 
-    /// @dev A second, best-effort sweep for anything the final price leaves under water
+    /// @dev A second, best-effort sweep for anything the final price leaves under water. Not after the launch's own
+    ///      swaps (the timelock's sale of held coins, IMD6900RobinhoodLaunch.sellHeld): it runs inside the sale's fee
+    ///      refund window, after the sale paid its fee, and a liquidation there books that fee as the locked pool's
+    ///      (PerpSwapLib.swapLeg's checkpoint), losing the sale its refund. The pre-trade sweep still runs for the sale:
+    ///      what the sale would sink is closed before it, and what it leaves under water the next trade's sweep closes.
     function _afterSwap(address sender, PoolKey calldata, SwapParams calldata, BalanceDelta, bytes calldata)
         internal
         override
         returns (bytes4, int128)
     {
-        _sweep(sender, 0, false, 0);
+        if (sender != ILockedPoolView(pool).launcher()) _sweep(sender, 0, false, 0);
         return (BaseHook.afterSwap.selector, int128(0));
     }
 
@@ -244,12 +259,19 @@ contract IMD6900Hook is BaseHook, Ownable {
         } else if (spec != 0) {
             // too little gas to sweep: refuse the trade while positions are open, rather than trade blind; an engine
             // that can't even say whether positions are open fails closed here too (unless fail-open is set)
-            (bool ok, bytes memory ret) = engine.staticcall(abi.encodeCall(IPerpSweep.openCount, ()));
-            if (!ok || ret.length < 32) {
+            (bool known, bool open) = _openPositions(engine);
+            if (!known) {
                 if (!sweepFailOpen) revert SweepUnavailable();
-            } else if (abi.decode(ret, (uint256)) != 0) {
+            } else if (open) {
                 revert SweepGasStarved();
             }
         }
+    }
+
+    /// @dev Whether `engine` says it has positions open, and whether it could say at all
+    function _openPositions(address engine) internal view returns (bool known, bool open) {
+        (bool ok, bytes memory ret) = engine.staticcall{gas: 100_000}(abi.encodeCall(IPerpSweep.openCount, ()));
+        known = ok && ret.length >= 32;
+        open = known && abi.decode(ret, (uint256)) != 0;
     }
 }

@@ -162,6 +162,45 @@ contract PerpsTest is Test {
         assertEq(POT.balance - potBefore, owed, "all of it, as ETH, to the pot bridge");
     }
 
+    /// The audit's second finding: unwiring the engine stranded every open position (their closes revert NotRefunded)
+    function test_TheEngineCantBeUnwiredWithPositionsOpen() public {
+        vm.prank(ALICE);
+        uint256 id = engine.openLong{value: 0.1 ether}(5, 0);
+        vm.prank(TL);
+        vm.expectRevert(IMD6900Hook.PerpsOpen.selector);
+        hook.setPerpEngine(address(0));
+        vm.prank(TL);
+        vm.expectRevert(IMD6900Hook.PerpsOpen.selector);
+        hook.setPerpEngine(address(0xBEEF));
+        assertEq(hook.perpEngine(), address(engine));
+        vm.prank(ALICE);
+        engine.close(id, 0); // still wired, so it closes
+        assertEq(engine.openCount(), 0);
+        vm.prank(TL);
+        hook.setPerpEngine(address(0)); // nothing open: the way out stays
+        assertEq(hook.perpEngine(), address(0));
+    }
+
+    /// The audit's third finding, with the real engine: the timelock's sale with a long the sale sinks. The pre-trade
+    /// sweep liquidates it (no bad debt), and the sale keeps its fee refund all the same
+    function test_TheTimelocksSaleSweepsFirstAndKeepsItsRefund() public {
+        vm.prank(ALICE);
+        uint256 id = engine.openLong{value: 0.1 ether}(5, 0);
+        assertFalse(engine.isLiquidatable(id));
+        pool.collect();
+        uint256 held = L.excessHeld();
+        uint256 stakers = engine.totalEth();
+        vm.prank(TL);
+        uint256 eth = L.sellHeld(0, 0, TL); // everything the opening buy landed, back into the pool
+        assertGt(eth, 0);
+        assertEq(engine.openCount(), 0, "liquidated in the sale's pre-trade sweep");
+        assertEq(engine.unabsorbedEth(), 0, "no bad debt");
+        assertGe(engine.totalEth(), stakers, "the stakers' ETH whole");
+        assertLt(L.excessHeld(), held / 10_000, "fee-free: only 4.44% cubed of it came back unsold");
+        (, uint256 coins) = pool.collect();
+        assertLt(coins, held / 100_000, "the sale's fee came back to the launch, not into the pool");
+    }
+
     function test_NoFeeMoveWithAPositionOpen() public {
         vm.prank(ALICE);
         engine.openLong{value: 0.1 ether}(5, 0);

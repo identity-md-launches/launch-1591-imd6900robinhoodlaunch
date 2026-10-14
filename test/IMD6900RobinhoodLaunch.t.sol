@@ -103,6 +103,40 @@ contract RefundingEngine {
     receive() external payable {}
 }
 
+/// A payee that refuses ETH until told otherwise (a paused or upgraded pot bridge)
+contract Refuser {
+    bool public open;
+    function setOpen(bool o) external { open = o; }
+    receive() external payable { require(open, "no"); }
+}
+
+/// A perps engine whose sweeps liquidate: a refunded sell inside the hook's callback, the way PerpSwapLib.swapLeg
+/// settles a liquidation (checkpoint, swap, refund), in whichever sweep the hook runs; it counts each kind
+contract SweepingEngine {
+    IPoolManager immutable pm;
+    IMD6900LockedPool immutable lp;
+    uint256 public preSweeps;
+    uint256 public postSweeps;
+    uint256 public amount; // what each liquidation sells
+    constructor(IPoolManager pm_, IMD6900LockedPool lp_) { (pm, lp) = (pm_, lp_); }
+    function openCount() external pure returns (uint256) { return 1; }
+    function arm(uint256 a) external { amount = a; }
+    function sweepLiquidations(address, int256 spec, bool, uint160) external returns (uint8) {
+        if (spec != 0) ++preSweeps; else ++postSweeps;
+        if (amount == 0) return 0;
+        PoolKey memory k = lp.poolKey();
+        lp.feeCheckpoint();
+        BalanceDelta d = pm.swap(k, SwapParams(false, -int256(amount), TickMath.MAX_SQRT_PRICE - 1), "");
+        lp.feeRefund(address(this));
+        pm.sync(k.currency1);
+        IERC20(Currency.unwrap(k.currency1)).transfer(address(pm), uint128(-d.amount1()));
+        pm.settle();
+        pm.take(k.currency0, address(this), uint128(d.amount0()));
+        return 0;
+    }
+    receive() external payable {}
+}
+
 /// A perps engine whose open positions the test sets (and one that can't say)
 contract CountingEngine {
     uint256 public openCount;
@@ -854,6 +888,151 @@ contract IMD6900RobinhoodLaunchTest is Test {
         assertFalse(ok);
         (ok,) = t.call(abi.encodeWithSignature("mint(address,uint256)", address(this), 1));
         assertFalse(ok);
+    }
+
+    /*                        THE AUDIT'S FINDINGS                          */
+
+    /// A refused share stays that payee's: before the fix every split() divided it again among all the payees, so a
+    /// reverting pot bridge drifted the pot's 90% into the $IMD bucket (1 - 0.9^n of it after n calls)
+    function test_ARefusedShareIsOwedNotReSplit() public {
+        _launch();
+        vm.etch(POT, type(Refuser).runtimeCode); // the pot bridge refuses (paused, upgraded): with the defaults 90% is its
+        vm.deal(address(L), 1 ether);
+        L.split();
+        assertEq(L.owed(POT), 0.9 ether, "the refused 90% is booked to it");
+        assertEq(L.owedTotal(), 0.9 ether);
+        assertEq(L.imdBucket(), 0.1 ether);
+        for (uint256 i; i < 50; ++i) L.split();
+        assertEq(L.imdBucket(), 0.1 ether, "no drift into the $IMD bucket (0.995 ETH of it before the fix)");
+        assertEq(L.owed(POT), 0.9 ether);
+        vm.deal(address(L), address(L).balance + 1 ether); // more fees: the new share joins what it is owed
+        L.split();
+        assertEq(L.owed(POT), 1.8 ether);
+        assertEq(L.imdBucket(), 0.2 ether);
+        assertEq(address(L).balance, 2 ether, "nothing left but the bucket and what is owed");
+    }
+
+    function test_AnOwedShareIsPaidOnceThePayeeAccepts() public {
+        _launch();
+        Refuser r = new Refuser();
+        address[] memory to = new address[](2);
+        uint16[] memory bps = new uint16[](2);
+        (to[0], bps[0], to[1], bps[1]) = (address(r), 9_000, L.IMD_BURN(), 1_000);
+        vm.prank(TL);
+        L.setPayees(to, bps);
+        vm.deal(address(L), 1 ether);
+        L.split();
+        L.split();
+        assertEq(L.owed(address(r)), 0.9 ether);
+        r.setOpen(true);
+        L.split();
+        assertEq(address(r).balance, 0.9 ether, "paid in full once it accepts");
+        assertEq(L.owedTotal(), 0);
+        assertEq(L.owed(address(r)), 0);
+        assertEq(L.imdBucket(), 0.1 ether);
+    }
+
+    /// Dropping a payee from the split cancels what it was owed: the next split divides it among the new payees
+    function test_DroppingAPayeeCancelsWhatItWasOwed() public {
+        _launch();
+        Refuser r = new Refuser();
+        address[] memory to = new address[](2);
+        uint16[] memory bps = new uint16[](2);
+        (to[0], bps[0], to[1], bps[1]) = (address(r), 9_000, L.IMD_BURN(), 1_000);
+        vm.prank(TL);
+        L.setPayees(to, bps);
+        vm.deal(address(L), 1 ether);
+        L.split();
+        assertEq(L.owed(address(r)), 0.9 ether);
+        (to[0], to[1]) = (L.IMD_BURN(), POT); // the same payees in another order keep it
+        vm.prank(TL);
+        L.setPayees(to, bps);
+        assertEq(L.owedTotal(), 0, "cancelled: the refuser is no longer a payee");
+        assertEq(L.owed(address(r)), 0);
+        uint256 potBefore = POT.balance;
+        L.split();
+        assertEq(POT.balance - potBefore, 0.09 ether, "10% of the 0.9 ETH to the pot (POT_BRIDGE at 10%)");
+        assertEq(L.imdBucket(), 0.1 ether + 0.81 ether, "90% of it to $IMD's burn, as the new split says");
+    }
+
+    /// The timelock's recoverEth takes the ETH behind the bookings with it
+    function test_RecoverEthDropsTheBookings() public {
+        _launch();
+        vm.etch(POT, type(Refuser).runtimeCode);
+        vm.deal(address(L), 1 ether);
+        L.split();
+        assertEq(L.owed(POT), 0.9 ether);
+        vm.prank(TL);
+        L.recoverEth(R, 0.95 ether);
+        assertEq(L.owedTotal(), 0, "what was owed is gone with it");
+        assertEq(L.owed(POT), 0);
+        assertEq(L.imdBucket(), 0.05 ether, "the bucket shrinks to what is left");
+        assertEq(address(L).balance, 0.05 ether);
+        assertEq(L.split(), 0, "nothing beyond the bucket to split");
+    }
+
+    /// The hook's owner can't unwire or replace an engine while it reports positions open: only the wired engine's
+    /// swaps are refunded (isRefunded), so an unwired engine's closes and liquidations would revert NotRefunded, with
+    /// the traders' collateral locked in it for good
+    function test_TheEngineCantBeUnwiredWithPositionsOpen() public {
+        _launch();
+        CountingEngine engine = new CountingEngine();
+        vm.prank(TL);
+        hook.setPerpEngine(address(engine));
+        engine.set(3, false);
+        vm.prank(TL);
+        vm.expectRevert(IMD6900Hook.PerpsOpen.selector);
+        hook.setPerpEngine(address(0));
+        vm.prank(TL);
+        vm.expectRevert(IMD6900Hook.PerpsOpen.selector);
+        hook.setPerpEngine(address(0xBEEF));
+        assertEq(hook.perpEngine(), address(engine));
+        assertTrue(pool.isRefunded(address(engine)), "still the refunded engine: its positions can close");
+        vm.prank(TL);
+        hook.setPerpEngine(address(engine)); // the same engine again: nothing changes
+        engine.set(0, false);
+        vm.prank(TL);
+        hook.setPerpEngine(address(0)); // nothing open: the way out stays
+        assertEq(hook.perpEngine(), address(0));
+        // an engine that can't even say is replaceable: that broken wiring is what the escape hatch is for
+        vm.prank(TL);
+        hook.setPerpEngine(address(engine));
+        vm.etch(address(engine), hex"fe");
+        vm.prank(TL);
+        hook.setPerpEngine(address(0));
+        assertEq(hook.perpEngine(), address(0));
+    }
+
+    /// The timelock's sale is fee-free even when the engine liquidates inside it: the pre-trade sweep runs (and its
+    /// liquidation's own refund pair leaves the sale's fee alone), the post-trade sweep doesn't run inside the sale's
+    /// refund window (before the fix its checkpoint booked the sale's fee as the pool's: back = 0, the fee lost)
+    function test_TheSalesRefundSurvivesALiquidationInTheSweep() public {
+        (address t,) = _launchHeld();
+        SweepingEngine engine = new SweepingEngine(PM, pool);
+        vm.prank(TL);
+        hook.setPerpEngine(address(engine));
+        PoolKey memory k = pool.poolKey();
+        trader.swap(k, true, -1 ether);
+        uint256 coins = IERC20(t).balanceOf(address(trader));
+        vm.prank(address(trader));
+        IERC20(t).transfer(address(engine), coins); // what its liquidations sell
+        engine.arm(coins / 10);
+        pool.collect(); // the fees so far out of the way
+        (uint256 pre0, uint256 post0) = (engine.preSweeps(), engine.postSweeps()); // the trader's swap had both
+        uint256 held = L.excessHeld();
+        uint256 engineBefore = address(engine).balance;
+        vm.prank(TL);
+        uint256 eth = L.sellHeld(held / 2, 0, R);
+        assertEq(R.balance, eth);
+        assertGt(engine.preSweeps(), pre0, "the pre-trade sweep ran, and liquidated");
+        assertGt(address(engine).balance, engineBefore, "its liquidation sold inside the sale");
+        assertEq(engine.postSweeps(), post0, "no post-trade sweep inside the sale's refund window");
+        assertLt(L.excessHeld(), held - held / 2 + held / 2 / 10_000, "all of it sold but the dust of the last round");
+        (, uint256 feeCoins) = pool.collect();
+        assertLt(feeCoins, held / 2 / 100_000, "fee-free: the sale's fee came back to the launch, not into the pool");
+        // every other swap still gets both sweeps
+        trader.swap(k, true, -0.1 ether);
+        assertEq(engine.postSweeps(), post0 + 1);
     }
 
     /*                               HELPERS                                */
