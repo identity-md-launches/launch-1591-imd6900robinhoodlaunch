@@ -3,6 +3,7 @@ pragma solidity ^0.8.26;
 
 import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
 import {IMD6900RobinhoodLaunch} from "../src/IMD6900RobinhoodLaunch.sol";
+import "./PoolManagerArtifact.sol"; // keeps the PoolManager's artifact built wherever this helper is
 
 /// @dev What script/launch.sh's `hook` step mines with cast, for the tests: the first salt whose CREATE2 address from
 ///      the launch carries exactly its FLAGS and doesn't start with 0x91

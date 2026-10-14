@@ -60,7 +60,8 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
     /// @notice The coin's address starts with this (its top 16 bits): {launch} refuses any other
     uint16 public constant VANITY = 0x6900;
     uint16 public constant IMD_BPS = 1_000;
-    /// @notice The most one {burnImd} spends: under what sandwiching it would be worth through two 1% fees
+    /// @notice The most {burnImd} spends per block timestamp (one call a timestamp, so one transaction, or one block,
+    ///         can never spend more): under what sandwiching it would be worth through two 1% fees
     uint256 public constant IMD_BUY_MAX = 0.1 ether;
     uint256 public constant MAX_PAYEES = 8;
     /// @notice Claims stay open at least this long after the launch before the unclaimed reserve can be released
@@ -99,6 +100,8 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
     /// @notice ETH set aside for $IMD's burn, spent by {burnImd}; and what it has bought and sent so far
     uint256 public imdBucket;
     uint256 public imdBurned;
+    /// @notice The block timestamp of the last {burnImd}: one buy a timestamp
+    uint256 public lastImdBuy;
     /// @notice $IMD's Robinhood pool: ETH / $IMD at this fee, tick spacing and hooks (the timelock may repoint it)
     uint24 public imdPoolFee = 10_000;
     int24 public imdPoolTickSpacing = 100;
@@ -110,6 +113,9 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
     /// @notice Where the perps engine's fees go (what its stakers and insurance don't keep): all of it as ETH to the pot
     ///         bridge, so the NFT floor pot on Ethereum, unless the timelock repoints it ({setPerpFeeTo})
     address public perpFeeTo = POT_BRIDGE;
+    /// @notice Perps fees {perpFeeTo} refused ({addPerpFees}): kept here and offered again with the next forwarding,
+    ///         to wherever {perpFeeTo} points then; never split. Cancelled only by the timelock's {recoverEth}.
+    uint256 public perpFeesOwed;
 
     /// @dev The timelock's payees once set (fixed-size); until then 90% the pot bridge, 10% $IMD's burn
     address[8] internal _payees;
@@ -124,7 +130,15 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
     event HookCreated(address hook, bytes32 salt);
     event ClaimsSet(bytes32 root, uint256 total, uint256 deadline);
     event EthWithdrawn(address to, uint256 amount);
-    event Launched(address token, uint160 sqrtPriceX96, int24 upperTick, uint256 ethSpent, uint256 bought, uint256 excess, address excessTo);
+    event Launched(
+        address token,
+        uint160 sqrtPriceX96,
+        int24 upperTick,
+        uint256 ethSpent,
+        uint256 bought,
+        uint256 excess,
+        address excessTo
+    );
     event Claimed(address indexed account, uint256 amount);
     event UnclaimedReleased(address to, uint256 amount);
     event ImdstrReleased(address to, uint256 amount);
@@ -160,6 +174,8 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
     error BadPayees();
     error NotTimelock();
     error OnlyPoolManager();
+    error BoughtThisBlock();
+    error NoRenounce();
 
     /// @param owner_       the team wallet: launches, sets the claim list and the payees
     /// @param poolManager_ Uniswap v4's PoolManager on Robinhood Chain
@@ -186,7 +202,9 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
         assembly ("memory-safe") {
             h := create2(0, add(init, 0x20), mload(init), salt)
         }
-        if (h == address(0) || uint160(h) & Hooks.ALL_HOOK_MASK != FLAGS || uint160(h) >> 152 == 0x91) revert BadHook();
+        if (h == address(0) || uint160(h) & Hooks.ALL_HOOK_MASK != FLAGS || uint160(h) >> 152 == 0x91) {
+            revert BadHook();
+        }
         pool.setHook(h);
         hook = IMD6900Hook(h);
         hookSalt = salt;
@@ -208,18 +226,35 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
     }
 
     /// @notice The perps engine's fees (PerpEngine.flushFees, with this contract as its fee sink): straight on to
-    ///         {perpFeeTo}, none of it split or kept here
+    ///         {perpFeeTo}, none of it split. What it refuses is kept here for it ({perpFeesOwed}) and offered again
+    ///         with the next forwarding, so a refusing destination never blocks the engine's flush.
     function addPerpFees() external payable {
         address to = perpFeeTo;
-        SafeTransferLib.safeTransferETH(to, msg.value);
-        emit PerpFeesForwarded(to, msg.value);
+        uint256 pay = msg.value + perpFeesOwed;
+        if (pay == 0) return;
+        (bool ok,) = to.call{value: pay}("");
+        if (ok) {
+            perpFeesOwed = 0;
+            emit PerpFeesForwarded(to, pay);
+        } else {
+            perpFeesOwed = pay;
+            emit PayFailed(to, pay);
+        }
+    }
+
+    /// @notice Never: the launch, the claims and the held coins must always have an owner (as the hook and the engine)
+    function renounceOwnership() public payable override {
+        revert NoRenounce();
     }
 
     /// @notice The coin's address for `salt`: what the owner mines a vanity salt against
     function tokenAddress(bytes32 salt) public view returns (address) {
         bytes32 h = keccak256(
             abi.encodePacked(
-                bytes1(0xff), address(this), salt, keccak256(abi.encodePacked(type(IMD6900).creationCode, abi.encode(address(this))))
+                bytes1(0xff),
+                address(this),
+                salt,
+                keccak256(abi.encodePacked(type(IMD6900).creationCode, abi.encode(address(this))))
             )
         );
         return address(uint160(uint256(h)));
@@ -238,7 +273,9 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
             return (to, bps);
         }
         (to, bps) = (new address[](n), new uint16[](n));
-        for (uint256 i; i < n; ++i) (to[i], bps[i]) = (_payees[i], _shares[i]);
+        for (uint256 i; i < n; ++i) {
+            (to[i], bps[i]) = (_payees[i], _shares[i]);
+        }
     }
 
     /// @notice What is still reserved for claims
@@ -293,7 +330,7 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
 
         uint256 spend = address(this).balance;
         if (spend == 0) revert NoEth();
-        bought = abi.decode(poolManager.unlock(abi.encode(uint8(0), spend)), (uint256));
+        (bought,) = abi.decode(poolManager.unlock(abi.encode(uint8(0), spend)), (uint256, uint256));
         if (bought < minBought || bought < claimTotal) revert Short(bought);
 
         uint256 excess = SafeTransferLib.balanceOf(t, address(this)) - claimTotal; // the opening's rounding dust included
@@ -365,10 +402,14 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
         if (amount == 0) revert NoEth();
         SafeTransferLib.safeTransferETH(to, amount);
         uint256 left = address(this).balance;
-        if (imdBucket + owedTotal > left) {
-            // what was booked is gone with it: the payees' owed shares first, then what was set aside for $IMD
+        if (imdBucket + owedTotal + perpFeesOwed > left) {
+            // what was booked is gone with it: the payees' owed shares and the perps' first, then what was set aside
+            // for $IMD
             (address[] memory ps,) = payees();
-            for (uint256 i; i < ps.length; ++i) _cancelOwed(ps[i]);
+            for (uint256 i; i < ps.length; ++i) {
+                _cancelOwed(ps[i]);
+            }
+            perpFeesOwed = 0;
             if (imdBucket > left) imdBucket = left;
         }
         emit EthRecovered(to, amount);
@@ -450,9 +491,10 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
         bytes32 leaf = keccak256(bytes.concat(keccak256(abi.encode(msg.sender, allowance))));
         if (!_verify(proof, claimRoot, leaf)) revert BadProof();
         uint256 done = claimedBy[msg.sender] + amount;
-        if (done > allowance) revert OverClaim();
+        uint256 total = claimedTotal + amount;
+        if (done > allowance || total > claimTotal) revert OverClaim(); // never past the reserve, whatever the root sums to
         claimedBy[msg.sender] = done;
-        claimedTotal += amount;
+        claimedTotal = total;
         SafeTransferLib.safeTransferFrom(imdstr, msg.sender, address(this), amount);
         SafeTransferLib.safeTransfer(token, msg.sender, amount);
         emit Claimed(msg.sender, amount);
@@ -464,7 +506,7 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
     ///         others.
     function split() public nonReentrant returns (uint256 amount) {
         if (token == address(0)) revert NotLaunched();
-        amount = address(this).balance - imdBucket - owedTotal;
+        amount = address(this).balance - imdBucket - owedTotal - perpFeesOwed;
         if (amount == 0 && owedTotal == 0) return 0;
         (address[] memory to, uint16[] memory bps) = payees();
         for (uint256 i; i < to.length; ++i) {
@@ -491,22 +533,28 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
         emit Split(amount);
     }
 
-    /// @notice Buys $IMD with what is set aside for its burn, at most {IMD_BUY_MAX} a call, and sends it to IMD's burn
-    ///         executor (anyone can then bridge it to Base, where it is destroyed). Anyone.
+    /// @notice Buys $IMD with what is set aside for its burn, at most {IMD_BUY_MAX} a block timestamp (one call a
+    ///         timestamp: a transaction that loops it spends no more than one call), and sends it to IMD's burn
+    ///         executor (anyone can then bridge it to Base, where it is destroyed). Anyone. The bucket is debited by
+    ///         what the pool took, which is less than offered only when its liquidity runs out.
     /// @param minImd the least $IMD the buy may return
     function burnImd(uint256 minImd) external nonReentrant returns (uint256 imd) {
+        if (lastImdBuy == block.timestamp) revert BoughtThisBlock();
+        lastImdBuy = block.timestamp;
         uint256 spend = imdBucket < IMD_BUY_MAX ? imdBucket : IMD_BUY_MAX;
         if (spend == 0) revert NoEth();
-        imdBucket -= spend;
-        imd = abi.decode(poolManager.unlock(abi.encode(uint8(1), spend)), (uint256));
+        uint256 ethIn;
+        (imd, ethIn) = abi.decode(poolManager.unlock(abi.encode(uint8(1), spend)), (uint256, uint256));
         if (imd < minImd) revert Short(imd);
+        imdBucket -= ethIn;
         SafeTransferLib.safeTransfer(IMD, imdBurn, imd);
         imdBurned += imd;
-        emit ImdBurned(spend, imd);
+        emit ImdBurned(ethIn, imd);
     }
 
     function imdPoolKey() public view returns (PoolKey memory) {
-        return PoolKey(Currency.wrap(address(0)), Currency.wrap(IMD), imdPoolFee, imdPoolTickSpacing, IHooks(imdPoolHooks));
+        return
+            PoolKey(Currency.wrap(address(0)), Currency.wrap(IMD), imdPoolFee, imdPoolTickSpacing, IHooks(imdPoolHooks));
     }
 
     /// @notice Collects the pool's fees (its IMD6900 burned, its ETH here) and splits the ETH
@@ -551,7 +599,7 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
         uint256 out = uint256(uint128(d.amount1()));
         poolManager.settle{value: ethIn}();
         poolManager.take(key.currency1, address(this), out);
-        return abi.encode(out);
+        return abi.encode(out, ethIn);
     }
 
     /*                              INTERNAL                                */

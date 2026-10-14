@@ -13,15 +13,16 @@ the perps engine has positions open, the fee refund pair, the fee split's defaul
 `src/perps/*` (so `ENGINE_CODE_HASH` and `VAULT_CODE_HASH` are unchanged and `test_ThePerpsCodeIsTheAuditedCode`
 holds).
 
-What changed is what the imported audit found. Each finding was reproduced by reading the exact code path, and
-each fix carries a test. Rehearsed locally: `forge build`, `forge test` (62 tests, all passing, with the verifier's
-fuzz seed), and the protected admission test (`Contracts.protected.t.sol`) against the launch's creation code with
-the four real constructor arguments: constructor runs on an empty chain, runtime 23,849 bytes (under EIP-170's
-24,576), no forbidden opcodes.
+What changed is what the imported audit found (sections 1–4) and what the independent review of the accepted work
+found (section 5). Each finding was reproduced by reading the exact code path or by running the reviewer's proof, and
+each fix carries a test. Rehearsed locally: `forge build`, `forge test` (67 tests, all passing, with the verifier's
+fuzz seed and an empty environment), and the protected admission test (`Contracts.protected.t.sol`) against the
+launch's creation code with the four real constructor arguments: constructor runs on an empty chain, runtime 24,022
+bytes (under EIP-170's 24,576), no forbidden opcodes.
 
 Deploy gas, measured on a local anvil node with the real arguments (the in-test figure from `vm.deployCode` is not
-a measurement): 8,019,186 gas, against 7,788,069 for the unmodified commit (runtime 22,779 bytes). The brief's
-"about 6.9M" predates the perps additions already in the commit as it arrived; the fixes here add about 3%. It fits
+a measurement): 8,056,611 gas, against 7,788,069 for the unmodified commit (runtime 22,779 bytes). The brief's
+"about 6.9M" predates the perps additions already in the commit as it arrived; the fixes here add about 3.5%. It fits
 one transaction (under half of EIP-7825's cap, as `test_FitsOneTransaction` requires) and is the same from any
 deployer.
 
@@ -114,11 +115,83 @@ so a search costs no memory however long it runs. The salts found are the same.
 
 `README.md`: two sentences updated for the hook's new behaviour (the post-trade sweep and `setPerpEngine`).
 
+## 5. The independent review of the accepted work (this revision)
+
+The verifier's Slither runs crashed in Slither's own code (see the next section), so the work above was first
+resubmitted unchanged; the review that then read it reported the findings below. Each was reproduced before anything
+changed. `src/perps/*` is still untouched (the audited code hashes hold).
+
+### 5a. `burnImd`'s cap bounded one call, not one transaction (review: medium, with a proof) — fixed
+
+**Reproduced** with the reviewer's proof: `burnImd` is permissionless and `nonReentrant` only blocks nesting, so one
+transaction looping it spent the whole 0.678 ETH bucket at whatever price the same transaction had pushed the $IMD pool
+to; `IMD_BUY_MAX` (0.1 ETH, "under what sandwiching it would be worth") bounded nothing.
+
+**Change** (`src/IMD6900RobinhoodLaunch.sol`): `burnImd` records `lastImdBuy = block.timestamp` and reverts
+`BoughtThisBlock` when called again at the same timestamp. One transaction, and one block, can spend at most
+`IMD_BUY_MAX`; the next timestamp buys again. A timestamp rather than `block.number`: on an Arbitrum-based chain such as
+Robinhood's, `block.number` is the L1's, and a timestamp bounds a transaction on any chain. The constant's NatSpec now
+states the guarantee it gives. **Test**: `test_OneImdBuyATimestamp` (a loop of eleven calls spends 0.1 ETH, the repeat
+reverts, the next second buys again), and the reviewer's proof (`Proof_644c65575bf3.t.sol`) passes.
+
+The proof had failed on the verifier with `vm.deployCode: no matching artifact found`: its build compiles `src/`, the
+non-test helpers in `test/` and the proof, without the project's `*.t.sol` files, which were the only importers of
+v4-core's `PoolManager`. `test/PoolManagerArtifact.sol` (compile-only, one import, also imported by `test/HookSalt.sol`)
+keeps the artifact in such a build. Rehearsed on a copy of the tree with every `*.t.sol` removed and the proof under
+`test/imd-proof-4ad035ff/`: it passes there. Not a contract change; `PoolManager` is still used by the tests only.
+
+### 5b. The bucket debited by the offer, not by what the $IMD pool took (review: low) — fixed
+
+**Reproduced**: with the stand-in pool's liquidity in one band, the pool took 0.0075 ETH of the 0.1 ETH offered, the
+bucket fell by 0.1 ETH, and the next `split()` would have sent 90% of the difference to the pot bridge.
+**Change**: `unlockCallback` returns `(out, ethIn)` for both buys; `burnImd` debits `imdBucket` by `ethIn` after the
+unlock (and emits it); `launch()` decodes the pair (its own buy cannot underfill with 1B coins of liquidity).
+**Test**: `test_TheBucketIsDebitedByWhatThePoolTook` (nothing beyond the split's rounding wei is left unbooked).
+
+### 5c. `claim()` never bounded `claimedTotal` by `claimTotal` (review: low) — fixed
+
+**Reproduced**: a one-leaf root (40M) set with `claimTotal` 20M paid 40M, 20M of it from the timelock's held coins,
+and `claimReserve()`, `releaseUnclaimed()` and `endClaims()` then underflowed. **Change**: `claim()` reverts
+`OverClaim` when `claimedTotal + amount > claimTotal`. **Test**: `test_ClaimsNeverPassTheReserve`.
+
+### 5d. `renounceOwnership` unguarded on the launch (review: low) — fixed
+
+**Reproduced**: solady's `Ownable.renounceOwnership` succeeded and left `owner() == 0`, which before the launch kills
+`launch()` itself. **Change**: overridden to revert `NoRenounce`, as the hook and the engine already do.
+**Test**: `test_TheLaunchCantBeRenounced`.
+
+### 5e. `addPerpFees` reverted on a refusing destination (review: low) — fixed
+
+**Reproduced** by tracing `PerpEngine.flushFees` → `addPerpFees` → `SafeTransferLib.safeTransferETH`: a paused pot
+bridge made every flush revert and the engine's `feesOwed` grow until the timelock repointed it. **Change**: a
+tolerant call; what the destination refuses is booked as `perpFeesOwed`, excluded from `split()`'s base, offered again
+with the next forwarding (to wherever `perpFeeTo` points then) and dropped by `recoverEth` together with the other
+bookings. Never split: the perps' 70% stays the perps fee destination's. **Test**:
+`test_RefusedPerpFeesWaitForTheNextForwarding`; `test_PerpFeesReachThePot` (the real engine's flush) unchanged.
+
+### 5f. Not changed, recorded
+
+- **PerpVault's virtual shares and ETH in the PLV before the first deposit** (review: low). The arithmetic is as
+  reported: what `fundPlv` / `fundPlvToken` (the timelock, the engine's owner) or the engine's 20% fee share puts in the
+  PLV before anyone holds shares is priced into the 1e6 virtual shares, and so is their pro-rata part of all later
+  yield. It costs the funder only, never a depositor, and the fee share cannot precede a deposit in practice (an open
+  needs shares to lend against). `src/perps` is pinned by `ENGINE_CODE_HASH` / `VAULT_CODE_HASH` as the audited code,
+  so this is an operating rule for the timelock: fund the PLV only after the first community deposit.
+- **After `lowerFee` the hash-checked perps cannot be recreated** (review: info): `createPerps` is one-shot, the engine
+  binds its pool at creation, so a fee move leaves the engine failing closed (as documented) until the timelock wires a
+  hand-deployed one through `IMD6900Hook.setPerpEngine`, which checks no code hash. Trust assumption, unchanged.
+- **The engine's caps are sized against the virtual full-range depth** (review: info): about 8x the real in-range ETH
+  at the opening state (2.69 ETH real against 21.9 ETH virtual), so `maxNotionalBps` 3.5% is ~29% of the real ETH.
+  No bad debt follows (the price cannot leave the position's range while any coin is outside the pool); the caps are
+  the timelock's to tune on the live engine. Unchanged.
+- **The timelock's powers are undelayed in these contracts** (review: info): the delay is the external timelock's, as
+  the brief and README say. One addition from this revision: `perpFeesOwed` follows `setPerpFeeTo` at the next
+  forwarding and is dropped by `recoverEth`, like `owed` and `imdBucket`.
+
 ## Static analysis: Slither's crash, Aderyn in its place (no contract change)
 
-The verifier's Slither runs crashed in Slither's own code, so the work above was never judged on its merits; this
-revision resubmits it unchanged (no file under `src/`, `test/` or `script/` differs from the accepted tree) and records
-what the analyzers say.
+The verifier's Slither runs crashed in Slither's own code, so the work above was first resubmitted unchanged for the
+analyzers to be re-run; this section records what they say.
 
 Slither 0.11.6 crashes on this repository with `AssertionError` in `slithir/convert.py: convert_constant_types`
 (`assert len(types) == len(ir.arguments)`). Traced with a probe around that function: the node is
@@ -150,10 +223,10 @@ file carries while foundry.toml pins solc 0.8.26), the documented centralization
 ERC-20 calls in `PerpSwapLib.tryTransfer` / `tryTransferFrom`, which decode the returned data themselves and exist so
 a refusing token cannot grief a payout. None was changed.
 
-Re-run for this revision, on this machine: `forge build` (solc 0.8.26, via-IR, 31 s), `forge test` with the
-verifier's fuzz seed and an empty environment (62 passed, 0 failed), and `Contracts.protected.t.sol` against the
-launch's creation code with the four real constructor arguments on chain id 4663 (passes: constructor on an empty
-chain, runtime within EIP-170, no CALLCODE / DELEGATECALL / SELFDESTRUCT).
+Re-run for this revision, on this machine: `forge build` (solc 0.8.26, via-IR), `forge test` with the verifier's
+fuzz seed and an empty environment (67 passed, 0 failed, plus the reviewer's proof), and `Contracts.protected.t.sol`
+against the launch's creation code with the four real constructor arguments on chain id 4663 (passes: constructor on
+an empty chain, runtime 24,022 bytes within EIP-170, no CALLCODE / DELEGATECALL / SELFDESTRUCT).
 
 ## Launch facts for the manifest step (not written here)
 

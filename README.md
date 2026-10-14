@@ -33,14 +33,16 @@ pot on Ethereum) and 10% to $IMD's canonical burn (bought on $IMD's Robinhood po
 executor `0x4D6537ec564aFf82eABb1Ce5f355E817cBEA1e07`, fixed in the code, which bridges it to Base); nothing to the
 team. The fee paid in IMD6900 (on sells) is burned: the pot bridge carries ETH only. The perps engine's fees (its open fee
 and liquidation penalties, after its stakers' 20% and insurance's 10%, both editable in the engine) come in through
-`addPerpFees()` and go on, all of it, as ETH to the pot bridge. Every landing address is the timelock's to change: the
+`addPerpFees()` and go on, all of it, as ETH to the pot bridge (what it refuses waits here, `perpFeesOwed`, for the next
+forwarding, so a paused bridge never blocks the engine's flush). Every landing address is the timelock's to change: the
 split's payees and shares (`setPayees`), the perps fees' (`setPerpFeeTo`), the IMD6900 fees' (`setCoinFeeTo`, burned by
 default), IMD's burn executor (`setImdBurn`, the canonical one by default), $IMD's pool (`setImdPool`). The plan: most
 of it to the NFT floor pot for now, later (one timelock batch, no redeploy) to a contract rewarding the frens who link
 their fren NFT as their identity.md avatar.
 
 The road to the pot, end to end (each step anyone's to call; `script/launch.sh pot` does them all): `harvest()` here,
-`burnImd(min)` for the $IMD share, the pot bridge's `bridge()` (Robinhood → Across → Ethereum, from 0.05 ETH), then on
+`burnImd(min)` for the $IMD share (0.1 ETH at most per block timestamp, so no single transaction can buy more at a price
+it pushed), the pot bridge's `bridge()` (Robinhood → Across → Ethereum, from 0.05 ETH), then on
 Ethereum the pot hook's `depositBridgedFees()` (`0xA160…6444`), which adds it to the NFT pot: the strategy buys
 identity.md NFTs at the floor with it, and what it resells them for buys IMD6900 on Ethereum. Rehearsed on forks of
 both chains: 0.1 ETH bridged over Across, then 0.0995 into the pot. The split is the Robinhood timelock's to change (`setPayees`, the timelock's public delay (24h)).
