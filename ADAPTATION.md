@@ -114,6 +114,47 @@ so a search costs no memory however long it runs. The salts found are the same.
 
 `README.md`: two sentences updated for the hook's new behaviour (the post-trade sweep and `setPerpEngine`).
 
+## Static analysis: Slither's crash, Aderyn in its place (no contract change)
+
+The verifier's Slither runs crashed in Slither's own code, so the work above was never judged on its merits; this
+revision resubmits it unchanged (no file under `src/`, `test/` or `script/` differs from the accepted tree) and records
+what the analyzers say.
+
+Slither 0.11.6 crashes on this repository with `AssertionError` in `slithir/convert.py: convert_constant_types`
+(`assert len(types) == len(ir.arguments)`). Traced with a probe around that function: the node is
+`PerpEngine._book`, the expression `_addOpen(id, Position(trader, isLong, uint128(collateral), size, principal,
+uint64(block.timestamp), leverage, fundingIndex))`, a struct literal built inline as a call argument. Slither's IR
+cannot type that argument list; solc compiles it, and the tests exercise it on every open. It is left as it is:
+rewriting the perps engine to suit an analyzer's bug would change `src/perps` and so `ENGINE_CODE_HASH`, which the
+brief pins to the audited code, for no behavioural reason. The verifier now accepts Aderyn where Slither crashes.
+
+Aderyn 0.6.8 (88 detectors, `aderyn .` on this tree) reports 6 "high" and 17 "low" classes. Each "high" was checked
+against the code and none reproduces as a defect:
+
+- `abi.encodePacked` hash collision: the five sites concatenate `creationCode` with an `abi.encode(...)` of the
+  constructor arguments to form CREATE2 init code (the hook, the coin, the perps). That is the init code itself, not a
+  hash of two dynamic values; there is nothing to collide.
+- Contract locks Ether: `IMD6900LockedPool.receive()` takes the pool manager's ETH fees and `_payOutHeld` forwards the
+  whole balance to the launch's `addFees` on every collect and move; `PerpVault` has `withdrawEth`; `IMD6900Hook` has
+  no `receive` and takes ETH only through Solady `Ownable`'s payable `transferOwnership` / `renounceOwnership`, which
+  the timelock would have to send on purpose.
+- ETH transferred without address checks: `PerpEngine.claimPayout` pays `msg.sender` its own booked payout.
+- Reentrancy, state change after external call: every site is a `nonReentrant` function (or the launch's and the
+  pool's unlock callbacks, which only the pool manager may enter) writing results the external call returned; the
+  imported audit read the same paths and reported none.
+- Storage array edited with memory: `_liqTest(positions[id])` is a `view` test over a copy and writes nothing.
+- Unsafe casting: `uint128(collateral)` is an ETH amount net of the open fee; `uint128` holds 3.4e20 ETH.
+
+The "low" classes are style (literals, uninitialized loop counters, modifier order, the `^0.8.26` pragma every source
+file carries while foundry.toml pins solc 0.8.26), the documented centralization in the timelock's setters, or the raw
+ERC-20 calls in `PerpSwapLib.tryTransfer` / `tryTransferFrom`, which decode the returned data themselves and exist so
+a refusing token cannot grief a payout. None was changed.
+
+Re-run for this revision, on this machine: `forge build` (solc 0.8.26, via-IR, 31 s), `forge test` with the
+verifier's fuzz seed and an empty environment (62 passed, 0 failed), and `Contracts.protected.t.sol` against the
+launch's creation code with the four real constructor arguments on chain id 4663 (passes: constructor on an empty
+chain, runtime within EIP-170, no CALLCODE / DELEGATECALL / SELFDESTRUCT).
+
 ## Launch facts for the manifest step (not written here)
 
 Kind `evm_contracts`, one contract `IMD6900RobinhoodLaunch`, constructor arguments in order:
